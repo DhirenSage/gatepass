@@ -1,57 +1,32 @@
-import { useEffect } from "react";
-import "@/App.css";
-import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { useEffect, useRef, useState } from "react";
+import { BrowserRouter, Routes, Route, Navigate, Link, useNavigate } from "react-router-dom";
+import { Html5Qrcode } from "html5-qrcode";
 import axios from "axios";
-import { HOME } from "@/constants/testIds";
+import "@/App.css";
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
-const API = `${BACKEND_URL}/api`;
+const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
+const client = axios.create({ baseURL: API });
+const headers = () => ({ Authorization: `Bearer ${localStorage.getItem("euphoria_token") || ""}` });
+const errorText = (e) => typeof e?.response?.data?.detail === "string" ? e.response.data.detail : "Something went wrong. Please try again.";
 
-const Home = () => {
-  const helloWorldApi = async () => {
-    try {
-      const response = await axios.get(`${API}/`);
-      console.log(response.data.message);
-    } catch (e) {
-      console.error(e, `errored out requesting / api`);
-    }
-  };
-
-  useEffect(() => {
-    helloWorldApi();
-  }, []);
-
-  return (
-    // The marker attribute below lets the platform probe detect the stock splash — remove it with this page
-    <div data-emergent-splash>
-      <header className="App-header">
-        <a
-          data-testid={HOME.emergentLink}
-          className="App-link"
-          href="https://emergent.sh"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <img src="https://avatars.githubusercontent.com/in/1201222?s=120&u=2686cf91179bbafbc7a71bfbc43004cf9ae1acea&v=4" />
-        </a>
-        <p className="mt-5">Building something incredible ~!</p>
-      </header>
-    </div>
-  );
-};
-
-function App() {
-  return (
-    <div className="App">
-      <BrowserRouter>
-        <Routes>
-          <Route path="/" element={<Home />}>
-            <Route index element={<Home />} />
-          </Route>
-        </Routes>
-      </BrowserRouter>
-    </div>
-  );
+function Login() {
+  const [email, setEmail] = useState("admin@euphoria.local"); const [password, setPassword] = useState("EuphoriaAdmin!2026"); const [error, setError] = useState(""); const navigate = useNavigate();
+  async function submit(e) { e.preventDefault(); try { const r = await client.post("/auth/login", { email, password }); localStorage.setItem("euphoria_token", r.data.token); localStorage.setItem("euphoria_user", JSON.stringify(r.data.user)); navigate("/"); } catch (err) { setError(errorText(err)); } }
+  return <main className="auth-shell"><section className="auth-panel"><div className="brand-mark">E<span>•</span></div><p className="eyebrow">EVENT OPERATIONS</p><h1>Welcome to<br /><em>EUPHORIA</em></h1><p className="muted">Secure entry control for every arrival.</p><form onSubmit={submit} data-testid="login-form"><label>Email or username<input data-testid="login-email-input" value={email} onChange={e => setEmail(e.target.value)} /></label><label>Password<input data-testid="login-password-input" type="password" value={password} onChange={e => setPassword(e.target.value)} /></label>{error && <div className="alert danger" data-testid="login-error">{error}</div>}<button className="primary full" data-testid="login-submit-button">Enter control room →</button></form><p className="hint">Admin access · Scanner operators use the scanner portal</p></section><div className="auth-art"><div><p className="eyebrow cyan">ONE GATE. EVERY ENTRY.</p><h2>Make the moment<br /><span>count.</span></h2></div></div></main>;
 }
 
-export default App;
+function Shell({ children }) { const navigate = useNavigate(); const user = JSON.parse(localStorage.getItem("euphoria_user") || "{}"); function logout() { localStorage.clear(); navigate("/login"); } return <div className="app-shell"><aside><div className="brand-mark small">E<span>•</span></div><div className="side-label">CONTROL ROOM</div><nav><Link data-testid="nav-dashboard" to="/">◈ <span>Overview</span></Link><Link data-testid="nav-registrations" to="/registrations">▦ <span>Registrations</span></Link><Link data-testid="nav-import" to="/import">↥ <span>Import CSV</span></Link><Link data-testid="nav-scanner" to="/scanner">⌁ <span>Scanner</span></Link></nav><div className="side-bottom"><div className="operator"><span className="status-dot" />{user.display_name || "Admin"}<small>{user.role || "ADMIN"}</small></div><button className="ghost" data-testid="logout-button" onClick={logout}>↪ Sign out</button></div></aside><main className="content">{children}</main></div>; }
+
+function Dashboard() { const [stats, setStats] = useState({}); const [activity, setActivity] = useState([]); useEffect(() => { Promise.all([client.get("/dashboard/stats", { headers: headers() }), client.get("/dashboard/recent-scans", { headers: headers() })]).then(([a, b]) => { setStats(a.data); setActivity(b.data); }); }, []); return <Shell><header className="topbar"><div><p className="eyebrow">TUESDAY · OPERATIONS</p><h1>Good morning, <em>team.</em></h1></div><Link className="primary compact" data-testid="open-scanner-button" to="/scanner">Open scanner ↗</Link></header><section className="hero-band"><div><p className="eyebrow cyan">EUPHORIA 2026</p><h2>Entry, <span>in rhythm.</span></h2><p className="muted">One gate. Multiple operators. Zero duplicate entries.</p></div><div className="hero-orbit">E<span>•</span></div></section><div className="metric-grid"><Metric label="Registered" value={stats.total_registrations ?? "—"} tone="cyan"/><Metric label="Entered today" value={stats.entries_today ?? "—"} tone="green"/><Metric label="Entry rate" value={`${stats.entry_percentage ?? 0}%`} tone="gold"/><Metric label="Duplicate attempts" value={stats.duplicate_attempts ?? "—"} tone="red"/></div><section className="section-heading"><div><p className="eyebrow">LIVE ACTIVITY</p><h2>Recent scans</h2></div><span className="live-pill"><i /> LIVE</span></section><div className="activity-list">{activity.length ? activity.map((item, i) => <div className="activity-row" key={item.id || i} data-testid={`activity-row-${i}`}><span className={`scan-icon ${item.status === "ENTRY_ALLOWED" ? "ok" : "warn"}`}>{item.status === "ENTRY_ALLOWED" ? "✓" : "!"}</span><div><strong>{item.message}</strong><small>{item.registration_id || item.token_fingerprint}</small></div><time>{new Date(item.attempted_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><b className={item.status === "ENTRY_ALLOWED" ? "text-green" : "text-gold"}>{item.status.replaceAll("_", " ")}</b></div>) : <div className="empty">No scans yet. The gate is ready.</div>}</div></Shell>; }
+function Metric({ label, value, tone }) { return <div className={`metric ${tone}`} data-testid={`metric-${label.toLowerCase().replaceAll(" ", "-")}`}><small>{label}</small><strong>{value}</strong><span>system count</span></div>; }
+
+function Registrations() { const [data, setData] = useState({ items: [], total: 0 }); const [search, setSearch] = useState(""); const [message, setMessage] = useState(""); async function load(q = search) { const r = await client.get(`/registrations?page=1&page_size=50&search=${encodeURIComponent(q)}`, { headers: headers() }); setData(r.data); } useEffect(() => { load(""); }, []); async function generate(id) { const r = await client.post(`/passes/${id}/generate`, {}, { headers: headers() }); setMessage(`Pass ready · QR ending ${r.data.pass.qr_token_last4}`); load(); } return <Shell><PageTitle eyebrow="PARTICIPANTS" title="Registrations" action={<Link className="primary compact" to="/import">Import CSV ↥</Link>} /><div className="toolbar"><input data-testid="registration-search-input" placeholder="Search name, registration, email or phone" value={search} onChange={e => { setSearch(e.target.value); load(e.target.value); }} /><span>{data.total} records</span></div>{message && <div className="alert success" data-testid="registration-success">{message}</div>}<div className="table-wrap"><table><thead><tr><th>Registration</th><th>Participant</th><th>Event</th><th>Category</th><th>Pass</th><th>Entry</th><th>Action</th></tr></thead><tbody>{data.items.map(row => <tr key={row.id} data-testid={`registration-row-${row.id}`}><td className="mono">{row.registration_number}</td><td><strong>{row.participant_full_name}</strong><small>{row.email}</small></td><td>{row.event_name}</td><td><span className="tag">{row.event_category}</span></td><td><span className={`badge ${row.pass_status === "ACTIVE" ? "green" : "muted-badge"}`}>{row.pass_status}</span></td><td><span className={`badge ${row.entry_status === "ENTERED" ? "green" : "muted-badge"}`}>{row.entry_status}</span></td><td><button className="table-action" data-testid={`generate-pass-${row.id}`} onClick={() => generate(row.id)}>Generate pass</button></td></tr>)}</tbody></table>{!data.items.length && <div className="empty">No participants match this search.</div>}</div></Shell>; }
+
+function PageTitle({ eyebrow, title, action }) { return <header className="topbar"><div><p className="eyebrow">{eyebrow}</p><h1>{title}</h1></div>{action}</header>; }
+
+function ImportPage() { const [preview, setPreview] = useState(null); const [busy, setBusy] = useState(false); const [result, setResult] = useState(""); async function upload(e) { const file = e.target.files[0]; if (!file) return; setBusy(true); const form = new FormData(); form.append("file", file); try { const r = await client.post("/imports/preview", form, { headers: { ...headers(), "Content-Type": "multipart/form-data" } }); setPreview(r.data); setResult(""); } catch (err) { setResult(errorText(err)); } finally { setBusy(false); } } async function confirm() { const r = await client.post(`/imports/${preview.import_id}/confirm`, {}, { headers: headers() }); setResult(`${r.data.imported} participants imported successfully.`); setPreview(null); } return <Shell><PageTitle eyebrow="DATA INTAKE" title="Import registrations" action={<Link className="ghost compact" to="/registrations">View registrations →</Link>} /><div className="import-grid"><div className="upload-zone"><div className="upload-symbol">↥</div><h2>Upload the source file</h2><p>CSV with the six required EUPHORIA registration fields.</p><label className="primary upload-button" data-testid="csv-upload-label">{busy ? "Reading file…" : "Choose CSV file"}<input data-testid="csv-file-input" type="file" accept=".csv" onChange={upload} hidden /></label><div className="expected"><small>EXPECTED COLUMNS</small><code>Registration Number · Participant Full Name · Email · Phone · Event Name · Event Category</code></div></div>{preview && <div className="preview-panel"><div className="section-heading"><div><p className="eyebrow">STEP 2 · REVIEW</p><h2>{preview.filename}</h2></div><span className="tag">{preview.summary.valid} valid</span></div><div className="import-stats"><Metric label="Total" value={preview.summary.total} tone="cyan"/><Metric label="Invalid" value={preview.summary.invalid} tone="red"/><Metric label="Duplicates" value={preview.summary.duplicates} tone="gold"/></div><div className="preview-rows">{preview.rows.map(row => <div className="preview-row" key={row.row_number}><span className={`status-chip ${row.status.toLowerCase()}`}>{row.status}</span><strong>{row.data["Participant Full Name"]}</strong><small>{row.errors.join(" · ") || row.data.Email}</small></div>)}</div><button className="primary full" data-testid="confirm-import-button" disabled={!preview.summary.valid} onClick={confirm}>Confirm import · {preview.summary.valid} rows</button></div>}{result && <div className="alert success" data-testid="import-result">{result}</div>}</div></Shell>; }
+
+function Scanner() { const [result, setResult] = useState({ status: "READY", message: "Ready to scan" }); const [count, setCount] = useState(0); const scannerRef = useRef(null); const lock = useRef(false); useEffect(() => { const qr = new Html5Qrcode("reader"); scannerRef.current = qr; qr.start({ facingMode: "environment" }, { fps: 12, qrbox: { width: 280, height: 280 } }, async decoded => { if (lock.current) return; lock.current = true; try { const r = await client.post("/scanner/verify", { token: decoded }, { headers: headers() }); setResult(r.data); if (r.data.success) setCount(c => c + 1); } catch (e) { setResult({ status: "CONNECTION_LOST", message: "ENTRY CANNOT BE VERIFIED" }); } finally { setTimeout(() => { lock.current = false; setResult(s => s.status === "ENTRY_ALLOWED" || s.status === "ALREADY_SCANNED" || s.status === "INVALID_QR" ? s : { status: "READY", message: "Ready to scan" }); }, 1800); } }, () => {}).catch(() => setResult({ status: "CAMERA_ERROR", message: "Camera unavailable — allow camera access and retry." })); return () => { qr.stop().catch(() => {}); }; }, []); const tone = result.status === "ENTRY_ALLOWED" ? "scanner-success" : result.status === "READY" ? "scanner-ready" : "scanner-danger"; return <div className="scanner-page"><header className="scanner-header"><div className="brand-mark small">E<span>•</span></div><div><p className="eyebrow cyan">ENTRY SCANNER</p><strong>Operator console</strong></div><Link className="ghost" to="/">Exit</Link></header><main className="scanner-main"><div className="scanner-copy"><p className="eyebrow cyan">ONE GATE · ONLINE</p><h1>Scan the<br /><em>moment.</em></h1><p className="muted">Keep the pass inside the frame. Verification is server-side.</p><div className="scanner-counter"><strong>{count}</strong><span>successful scans this session</span></div></div><div className="scanner-stage"><div id="reader" data-testid="camera-preview" /><div className={`scan-result ${tone}`} data-testid="scan-result"><div className="result-symbol">{result.status === "ENTRY_ALLOWED" ? "✓" : result.status === "READY" ? "⌁" : "!"}</div><div><p className="eyebrow">{result.status.replaceAll("_", " ")}</p><h2>{result.message}</h2>{result.participant && <p>{result.participant.name} · {result.participant.registration_number}</p>}{result.entry_time && <small>{new Date(result.entry_time).toLocaleTimeString()}</small>}</div></div></div></main></div>; }
+
+function Protected({ children }) { return localStorage.getItem("euphoria_token") ? children : <Navigate to="/login" replace />; }
+export default function App() { return <BrowserRouter><Routes><Route path="/login" element={<Login />} /><Route path="/scanner" element={<Protected><Scanner /></Protected>} /><Route path="*" element={<Protected><Routes><Route path="/" element={<Dashboard />} /><Route path="/registrations" element={<Registrations />} /><Route path="/import" element={<ImportPage />} /></Routes></Protected>} /></Routes></BrowserRouter>; }
