@@ -1,0 +1,41 @@
+{
+  "summary": "Iteration 2 regression — all four code-review fixes verified end-to-end. Full backend test suite (17 tests, /app/backend/tests/) passes. Live SMTP email send + bulk-send counters verified against Gmail (2 sends total). UI login, dashboard live polling, add-participant modal, scanner-users nav, and scanner-login RBAC guard all work with zero page errors/warnings.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "/api/auth/login", "issue": "CORS still allow_credentials=false while login also sets httpOnly cookie; cookie will never be sent cross-site from the SPA (falls back to Bearer). Not blocking, but inconsistent with auth playbook."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_euphoria_api.py",
+    "/app/backend/tests/test_scanner_regression.py",
+    "/app/backend/tests/test_regression_iter2.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "Optional: reconcile CORS allow_credentials and cookie auth (playbook alignment) — currently harmless because frontend uses Bearer from JSON body."
+  ],
+  "critical_code_review_comments": [
+    "Fix (1) test files now source ADMIN_EMAIL/ADMIN_PASSWORD from env — verified; iter1 stale tests updated to reflect the RBAC lockdown so scanner/verify is only reachable by SCANNER role.",
+    "Fix (2) server.py current_user initializes user=None before the try; JWT decode failures and missing-user paths both raise 401 as expected — covered by test_current_user_no_token_401 and test_current_user_bad_token_401.",
+    "Fix (3) two empty catch blocks in App.js now log via console.warn (lines 107 and 160 — chime playback + dashboard poll). No unhandled console errors during a 4.5s dashboard mount.",
+    "Fix (4) bulk-send failed list key is now `r.registration_id || r.email` (App.js line 303) — stable across renders, no more index-key React warning."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_euphoria_api.py",
+    "/app/backend/tests/test_scanner_regression.py",
+    "/app/backend/tests/test_regression_iter2.py"
+  ],
+  "success_rate": {"backend": "100% (17/17 pytest)", "frontend": "100% of tested flows (login, dashboard poll, registrations, add-modal, scanner-users nav, scanner-login RBAC)"},
+  "test_credentials": "admin@euphoria.local / EuphoriaAdmin!2026 (from /app/backend/.env, matches /app/memory/test_credentials.md). Scanner user is generated per test via POST /api/scanner-users.",
+  "seed_data_creation": "Test participants created with TEST_REG_/TEST_SCAN_/TEST_DUP_/TEST_CSV_/TEST_EMAIL_ prefixes; two live Gmail sends performed to the configured SMTP account only (registrations@sageuniversity.in).",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Backend tests moved to pytest with dotenv-based env loading so `pytest backend/tests/` works without exporting envs. Scanner regression now uses pyzbar to decode the raw QR token from the base64 qr_image (libzbar0 was apt-installed). If pyzbar is missing on a fresh runner, `apt install libzbar0 && pip install pyzbar`. Live SMTP test kept out of the pytest suite to avoid flooding Gmail; validated once manually.",
+  "rca of the issue": "No new issues found. All 4 review fixes behave correctly."
+}

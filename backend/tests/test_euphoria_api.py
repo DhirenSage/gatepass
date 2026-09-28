@@ -1,11 +1,16 @@
+"""Core sanity regression - health, admin login, dashboard, registrations search.
+Scanner-specific behaviour lives in test_scanner_regression.py."""
 import os
+from pathlib import Path
 
 import pytest
 import requests
+from dotenv import load_dotenv
 
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 BASE_URL = os.environ["REACT_APP_BACKEND_URL"].rstrip("/")
-ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@euphoria.local")
+ADMIN_EMAIL = os.environ["ADMIN_EMAIL"]
 ADMIN_PASSWORD = os.environ["ADMIN_PASSWORD"]
 
 
@@ -45,7 +50,6 @@ def test_login_and_me(api, token):
 def test_invalid_login_and_missing_auth(api):
     bad = api.post(f"{BASE_URL}/api/auth/login", json={"email": ADMIN_EMAIL, "password": "wrong-password"})
     assert bad.status_code == 401
-    # Remove the valid login cookie retained by the module-scoped session before testing missing auth.
     api.cookies.clear()
     missing = api.get(f"{BASE_URL}/api/dashboard/stats")
     assert missing.status_code == 401
@@ -60,8 +64,7 @@ def test_dashboard_and_registration_search(auth):
     assert isinstance(rows.json()["items"], list)
 
 
-def test_invalid_qr_is_recorded(auth):
+def test_admin_forbidden_from_scanner_verify(auth):
+    """After the RBAC fix, admins must not be able to scan; only SCANNER role."""
     response = auth.post(f"{BASE_URL}/api/scanner/verify", json={"token": "invalid-token-value"})
-    assert response.status_code == 200
-    assert response.json()["status"] == "INVALID_QR"
-    assert response.json()["success"] is False
+    assert response.status_code == 403
