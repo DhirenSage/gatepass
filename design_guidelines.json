@@ -1,0 +1,60 @@
+{
+  "project_name": "EUPHORIA EVENT ENTRY SYSTEM",
+  "app_type": "hybrid_fullstack",
+  "theme": "Luxury Dark Mode with Electric Cyan and Deep Obsidian (#0A0A0A) + Electric Cyan #00E5FF & Gold Accents",
+  "typography": {
+    "heading_font": "Outfit, sans-serif",
+    "body_font": "Plus Jakarta Sans, sans-serif",
+    "mono_font": "JetBrains Mono, monospace"
+  },
+  "colors": {
+    "primary": "#00E5FF",
+    "secondary": "#7000FF",
+    "background": "#070709",
+    "surface": "#121216",
+    "surface_border": "#22222D",
+    "text_primary": "#F8FAFC",
+    "text_secondary": "#94A3B8",
+    "accent_success": "#10B981",
+    "accent_warning": "#F59E0B",
+    "accent_danger": "#EF4444"
+  },
+  "image_urls": {
+    "hero_banner": "https://images.unsplash.com/photo-1677186304454-6fbe1fe3aaef?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA4Mzl8MHwxfHNlYXJjaHwxfHxsdXh1cnklMjBnYWxhJTIwZW50cmFuY2UlMjB2aXAlMjBldmVudHxlbnwwfHx8fDE3OTA1ODU1Mjd8MA&ixlib=rb-4.1.0&q=85",
+    "event_stage": "https://images.unsplash.com/photo-1730662658734-c0de088a254b?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA4Mzl8MHwxfHNlYXJjaHwyfHxsdXh1cnklMjBnYWxhJTIwZW50cmFuY2UlMjB2aXAlMjBldmVudHxlbnwwfHx8fDE3OTA1ODU1Mjd8MA&ixlib=rb-4.1.0&q=85"
+  },
+  "components": [
+    "Admin Dashboard with Metrics & Quick Actions",
+    "Registration Management (Full CRUD, Filters, Passcode/QR Generation)",
+    "CSV/XLSX Import Preview & Validation Modal (6 Required Columns: Full Name, Email, Ticket Type, Organization, Phone, Seat/Table)",
+    "Event Configuration Panel (Title, Date, Time, Venue, Max Capacity, Active Gates)",
+    "Live Scanner Gate Interface (Continuous Browser Camera QR Scanning + Manual Passcode Lookup + Atomic Duplicate Prevention)",
+    "Reports & Audit Logs Viewer (Real-time scan attempts, success/failure metrics, exportable CSV)",
+    "Role Management (Admin vs Scanner Device Roles with PIN/Auth token headers)",
+    "Pass & Email Center (SMTP Config simulation, PDF Pass Generation, QR Code view & download)"
+  ],
+  "api_endpoints": [
+    "GET /api/health",
+    "GET /api/stats",
+    "GET /api/registrations",
+    "POST /api/registrations",
+    "POST /api/registrations/import",
+    "GET /api/events/config",
+    "PUT /api/events/config",
+    "POST /api/scan/verify",
+    "GET /api/audit/logs",
+    "GET /api/scanners",
+    "POST /api/scanners"
+  ],
+  "qr_concurrency_strategy": "MongoDB atomic findOneAndUpdate with status/scan_count check ensuring single-pass entry even across multiple concurrent scanner devices at the physical gate.",
+  "csv_import_strategy": "Client-side PapaParse or robust server-side text line parser for 6 columns (Full Name, Email, Ticket Type, Organization, Phone, Seat/Table) with live validation preview table showing duplicate/missing data before batch insertion.",
+  "pass_email_strategy": "Server-side qrcode generation + ReportLab PDF pass generation + simulated or configured SMTP email dispatch with direct inline QR code and secure ticket link.",
+  "deployment_architecture": "React SPA (Frontend) communicating with FastAPI (Backend) backed by MongoDB with REST endpoints and WebSocket/Polling sync for live gate counts.",
+  "universal_guidelines": [
+    "Every interactive element MUST include data-testid attribute",
+    "Never use complete transparent background in headers or overlays",
+    "Use generous spacing (p-6, p-8, gap-6) and avoid Inter for headings",
+    "Ensure all scan responses and error toasts provide distinct visual feedback for success vs duplicate vs invalid pass",
+    "All .js files used for React components"
+  ]
+}
