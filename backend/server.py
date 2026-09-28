@@ -531,6 +531,13 @@ async def entries_export(user=Depends(admin_user)):
     await audit(user, "ENTRIES_EXPORTED", "entry", None, {"count": len(rows)})
     return Response(content=buf.getvalue(), media_type="text/csv", headers={"Content-Disposition": 'attachment; filename="euphoria-entries.csv"'})
 
+@api.get("/dashboard/live-alerts")
+async def live_alerts(since: Optional[str] = None, limit: int = Query(30, ge=1, le=100), user=Depends(admin_user)):
+    match = {"status": {"$in": ["ALREADY_SCANNED", "INVALID_QR", "PASS_INACTIVE", "EVENT_CLOSED"]}}
+    if since: match["attempted_at"] = {"$gt": since}
+    pipeline = [{"$match": match}, {"$sort": {"attempted_at": -1}}, {"$limit": limit}, {"$lookup": {"from": "registrations", "localField": "registration_id", "foreignField": "id", "as": "reg"}}, {"$unwind": {"path": "$reg", "preserveNullAndEmptyArrays": True}}, {"$lookup": {"from": "users", "localField": "scanner_user_id", "foreignField": "id", "as": "scanner"}}, {"$unwind": {"path": "$scanner", "preserveNullAndEmptyArrays": True}}, {"$project": {"_id": 0, "id": 1, "status": 1, "message": 1, "attempted_at": 1, "token_fingerprint": 1, "registration_number": "$reg.registration_number", "participant_full_name": "$reg.participant_full_name", "event_category": "$reg.event_category", "scanner_display_name": "$scanner.display_name", "scanner_username": "$scanner.username"}}]
+    return await db.scan_attempts.aggregate(pipeline).to_list(limit)
+
 @api.get("/dashboard/live-entries")
 async def live_entries(since: Optional[str] = None, limit: int = Query(30, ge=1, le=100), user=Depends(admin_user)):
     match = {}

@@ -89,32 +89,39 @@ function useEntryChime() {
   const audioRef = useRef(null);
   const [muted, setMuted] = useState(() => localStorage.getItem("euphoria_chime_muted") === "1");
   useEffect(() => { localStorage.setItem("euphoria_chime_muted", muted ? "1" : "0"); }, [muted]);
-  function play() {
+  function tone(voices) {
     if (muted) return;
     try {
       if (!audioRef.current) { const Ctx = window.AudioContext || window.webkitAudioContext; if (!Ctx) return; audioRef.current = new Ctx(); }
       const ctx = audioRef.current; if (ctx.state === "suspended") ctx.resume();
       const now = ctx.currentTime;
-      [[988, 0], [1319, 0.12]].forEach(([freq, delay]) => {
-        const osc = ctx.createOscillator(); const gain = ctx.createGain();
-        osc.type = "sine"; osc.frequency.value = freq;
-        gain.gain.setValueAtTime(0, now + delay);
-        gain.gain.linearRampToValueAtTime(0.18, now + delay + 0.02);
-        gain.gain.exponentialRampToValueAtTime(0.0001, now + delay + 0.55);
-        osc.connect(gain).connect(ctx.destination);
-        osc.start(now + delay); osc.stop(now + delay + 0.6);
+      voices.forEach(({ freq, delay = 0, dur = 0.55, gain = 0.18, type = "sine" }) => {
+        const osc = ctx.createOscillator(); const g = ctx.createGain();
+        osc.type = type; osc.frequency.value = freq;
+        g.gain.setValueAtTime(0, now + delay);
+        g.gain.linearRampToValueAtTime(gain, now + delay + 0.02);
+        g.gain.exponentialRampToValueAtTime(0.0001, now + delay + dur);
+        osc.connect(g).connect(ctx.destination);
+        osc.start(now + delay); osc.stop(now + delay + dur + 0.05);
       });
     } catch (_) {}
   }
-  return { play, muted, setMuted };
+  return {
+    playSuccess: () => tone([{ freq: 988 }, { freq: 1319, delay: 0.12 }]),
+    playWarning: () => tone([{ freq: 440, dur: 0.28, gain: 0.22, type: "square" }, { freq: 330, delay: 0.22, dur: 0.4, gain: 0.22, type: "square" }, { freq: 440, delay: 0.55, dur: 0.28, gain: 0.22, type: "square" }]),
+    muted, setMuted,
+  };
 }
 
 function Dashboard() {
   const [stats, setStats] = useState({});
   const [entries, setEntries] = useState([]);
+  const [alerts, setAlerts] = useState([]);
   const [newIds, setNewIds] = useState(new Set());
+  const [newAlertIds, setNewAlertIds] = useState(new Set());
   const [paused, setPaused] = useState(false);
-  const cursor = useRef(null);
+  const entryCursor = useRef(null);
+  const alertCursor = useRef(null);
   const firstLoad = useRef(true);
   const chime = useEntryChime();
   useEffect(() => {
@@ -122,24 +129,34 @@ function Dashboard() {
     async function tick() {
       if (cancelled || paused) return;
       try {
-        const [s, e] = await Promise.all([
+        const [s, e, al] = await Promise.all([
           client.get("/dashboard/stats", { headers: headers() }),
-          client.get(`/dashboard/live-entries${cursor.current ? `?since=${encodeURIComponent(cursor.current)}` : ""}`, { headers: headers() }),
+          client.get(`/dashboard/live-entries${entryCursor.current ? `?since=${encodeURIComponent(entryCursor.current)}` : ""}`, { headers: headers() }),
+          client.get(`/dashboard/live-alerts${alertCursor.current ? `?since=${encodeURIComponent(alertCursor.current)}` : ""}`, { headers: headers() }),
         ]);
         if (cancelled) return;
         setStats(s.data);
         if (e.data.length) {
-          const freshIds = new Set(e.data.map(x => x.id));
           setEntries(prev => [...e.data, ...prev].slice(0, 60));
-          setNewIds(freshIds);
-          cursor.current = e.data[0].scanned_at;
-          if (!firstLoad.current) chime.play();
-          firstLoad.current = false;
+          setNewIds(new Set(e.data.map(x => x.id)));
+          entryCursor.current = e.data[0].scanned_at;
+          if (!firstLoad.current) chime.playSuccess();
           setTimeout(() => { if (!cancelled) setNewIds(new Set()); }, 2500);
-        } else if (!cursor.current) {
-          const initial = await client.get("/dashboard/live-entries?limit=30", { headers: headers() });
-          if (!cancelled) { setEntries(initial.data); if (initial.data.length) cursor.current = initial.data[0].scanned_at; firstLoad.current = false; }
+        } else if (!entryCursor.current) {
+          const init = await client.get("/dashboard/live-entries?limit=30", { headers: headers() });
+          if (!cancelled) { setEntries(init.data); if (init.data.length) entryCursor.current = init.data[0].scanned_at; }
         }
+        if (al.data.length) {
+          setAlerts(prev => [...al.data, ...prev].slice(0, 30));
+          setNewAlertIds(new Set(al.data.map(x => x.id)));
+          alertCursor.current = al.data[0].attempted_at;
+          if (!firstLoad.current) chime.playWarning();
+          setTimeout(() => { if (!cancelled) setNewAlertIds(new Set()); }, 3000);
+        } else if (!alertCursor.current) {
+          const initA = await client.get("/dashboard/live-alerts?limit=12", { headers: headers() });
+          if (!cancelled) { setAlerts(initA.data); if (initA.data.length) alertCursor.current = initA.data[0].attempted_at; }
+        }
+        firstLoad.current = false;
       } catch (_) {}
     }
     tick();
@@ -147,6 +164,7 @@ function Dashboard() {
     return () => { cancelled = true; clearInterval(id); };
   }, [paused]); // eslint-disable-line react-hooks/exhaustive-deps
   const now = new Date(); const day = now.toLocaleDateString([], { weekday: "long" }).toUpperCase();
+  const alertLabel = { ALREADY_SCANNED: "DUPLICATE SCAN", INVALID_QR: "INVALID QR", PASS_INACTIVE: "PASS INACTIVE", EVENT_CLOSED: "ENTRY CLOSED" };
   return <Shell>
     <header className="topbar"><div><p className="eyebrow">{day} · OPERATIONS</p><h1>Live gate <em>console.</em></h1></div><Link className="primary compact" data-testid="open-scanner-button" to="/scanner-users">Manage scanners ↗</Link></header>
     <section className="hero-band"><div><p className="eyebrow cyan">SAGE EUPHORIA 2026</p><h2>Entry, <span>in rhythm.</span></h2><p className="muted">One gate. Multiple operators. Zero duplicate entries.</p></div><div className="hero-orbit"><img src="/logos/euphoria-logo.png" alt="Euphoria" style={{width:"88px",height:"auto"}} /></div></section>
@@ -156,6 +174,20 @@ function Dashboard() {
       <Metric label="Entry rate" value={`${stats.entry_percentage ?? 0}%`} tone="gold"/>
       <Metric label="Duplicate attempts" value={stats.duplicate_attempts ?? "—"} tone="red"/>
     </div>
+
+    <section className="section-heading">
+      <div><p className="eyebrow red-eyebrow">SECURITY ALERTS</p><h2>Duplicate & invalid attempts</h2></div>
+      <span className="alert-count" data-testid="alert-total">{alerts.length} recent</span>
+    </section>
+    <div className="alerts-list" data-testid="live-alerts-stream">
+      {alerts.length ? alerts.slice(0, 8).map(a => <div className={`alert-row ${a.status.toLowerCase()} ${newAlertIds.has(a.id) ? "alert-flash" : ""}`} key={a.id} data-testid={`live-alert-${a.id}`}>
+        <span className="alert-icon">!</span>
+        <div><strong>{alertLabel[a.status] || a.status}</strong><small>{a.participant_full_name ? `${a.participant_full_name} · ${a.registration_number}` : `Unknown QR · ${a.token_fingerprint}`}</small></div>
+        <div className="entry-scanner"><small>OPERATOR</small><b>{a.scanner_display_name || a.scanner_username || "—"}</b></div>
+        <time>{new Date(a.attempted_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</time>
+      </div>) : <div className="empty compact-empty">No warnings — every scan so far has been clean.</div>}
+    </div>
+
     <section className="section-heading">
       <div><p className="eyebrow">LIVE GATE STREAM</p><h2>Scans, as they happen</h2></div>
       <div className="live-controls">
