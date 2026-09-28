@@ -20,7 +20,7 @@ from typing import Optional
 import bcrypt
 import jwt
 import qrcode
-from fastapi import APIRouter, Depends, FastAPI, File, Header, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, FastAPI, File, Header, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, EmailStr, Field
@@ -82,7 +82,8 @@ def verify_password(value: str, hashed: str) -> bool:
 def token_for(user: dict) -> str:
     return jwt.encode({"sub": user["id"], "role": user["role"], "exp": datetime.now(timezone.utc).timestamp() + 28800}, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
-async def current_user(authorization: Optional[str] = Header(default=None)):
+async def current_user(request: Request, authorization: Optional[str] = Header(default=None)):
+    authorization = authorization or (f"Bearer {request.cookies.get('access_token')}" if request.cookies.get("access_token") else None)
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "Authentication required")
     try:
@@ -123,6 +124,8 @@ async def seed_defaults():
     existing = await db.users.find_one({"email": admin_email})
     if not existing:
         await db.users.insert_one({"id": str(uuid.uuid4()), "username": "admin", "email": admin_email, "display_name": "EUPHORIA Admin", "password_hash": hash_password(os.environ["ADMIN_PASSWORD"]), "role": "ADMIN", "is_active": True, "created_at": now_iso(), "updated_at": now_iso()})
+    elif not verify_password(os.environ["ADMIN_PASSWORD"], existing["password_hash"]):
+        await db.users.update_one({"email": admin_email}, {"$set": {"password_hash": hash_password(os.environ["ADMIN_PASSWORD"]), "updated_at": now_iso()}})
     event = await db.events.find_one({"status": {"$in": ["ACTIVE", "DRAFT"]}})
     if not event:
         await db.events.insert_one({"id": str(uuid.uuid4()), "name": "EUPHORIA 2026", "description": "Event entry configuration", "start_date": "2026-01-01", "end_date": "2026-12-31", "entry_start_time": "00:00", "entry_end_time": "23:59", "timezone": "UTC", "status": "ACTIVE", "created_at": now_iso(), "updated_at": now_iso()})
@@ -138,11 +141,12 @@ async def health():
     return {"status": "ok", "service": "euphoria-entry"}
 
 @api.post("/auth/login")
-async def login(body: LoginRequest):
+async def login(body: LoginRequest, response: Response):
     user = await db.users.find_one({"$or": [{"email": body.email.lower()}, {"username": body.email.lower()}]}, {"_id": 0})
     if not user or not user.get("is_active") or not verify_password(body.password, user["password_hash"]):
         raise HTTPException(401, "Invalid email or password")
     await db.users.update_one({"id": user["id"]}, {"$set": {"last_login_at": now_iso()}})
+    response.set_cookie("access_token", token_for(user), httponly=True, secure=True, samesite="lax", max_age=28800)
     return {"token": token_for(user), "user": public(user)}
 
 @api.get("/auth/me")
@@ -150,8 +154,9 @@ async def me(user=Depends(current_user)):
     return public(user)
 
 @api.post("/auth/logout")
-async def logout(user=Depends(current_user)):
+async def logout(response: Response, user=Depends(current_user)):
     await audit(user, "LOGOUT")
+    response.delete_cookie("access_token")
     return {"success": True}
 
 @api.get("/events")

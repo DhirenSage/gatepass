@@ -1,0 +1,58 @@
+{
+  "summary": "Backend regression and live UI testing completed. Auth, protected dashboard, registration search, pass generation, invalid QR handling, dashboard metrics, and mobile overflow passed. Scanner route crashes during camera startup cleanup.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {
+        "endpoint": "/api/auth/login",
+        "issue": "Authentication is bearer-token/localStorage based; no httpOnly cookie is issued and CORS is configured with allow_credentials=false. This differs from the supplied auth playbook and increases browser token exposure."
+      }
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {
+        "component": "Scanner",
+        "issue": "Opening /scanner causes a React runtime error: Cannot stop, scanner is not running or paused. The camera preview never becomes usable and the app error overlay is shown.",
+        "selector": "[data-testid=\"camera-preview\"]",
+        "priority": "CRITICAL"
+      }
+    ],
+    "integration_issues": [
+      {
+        "flow": "Browser camera scanner startup",
+        "issue": "Html5Qrcode start failure is followed by unconditional qr.stop() cleanup; stop rejects when the scanner never started, producing an uncaught runtime error.",
+        "affected_selectors": ["[data-testid=\"nav-scanner\"]", "[data-testid=\"camera-preview\"]", "[data-testid=\"scan-result\"]"]
+      }
+    ],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_euphoria_api.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "Guard scanner cleanup so qr.stop() only runs after successful start (or ignore the not-running rejection), and add a camera permission/error fallback that does not crash the React tree.",
+    "Add unique data-testid attributes to remaining interactive controls such as the scanner Exit link and import View registrations link.",
+    "Decide whether auth should follow the supplied httpOnly-cookie playbook; if so, implement secure cookie issuance, explicit credentialed CORS, and logout cookie clearing.",
+    "Update seed_admin to reconcile an existing admin password when ADMIN_PASSWORD changes, rather than only seeding when the user is absent."
+  ],
+  "critical_code_review_comments": [
+    "Scanner useEffect cleanup calls qr.stop() unconditionally even when qr.start() failed; this is the direct cause of the reproducible uncaught runtime crash.",
+    "Registrations useEffect calls a function recreated on every render and omits it from dependencies, producing an ESLint exhaustive-deps warning and risking stale search behavior.",
+    "seed_defaults only inserts an admin and does not update an existing admin password, contrary to the auth playbook requirement."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_euphoria_api.py",
+    "/app/test_reports/iteration_1.json"
+  ],
+  "success_rate": {
+    "backend": "100% (5/5 automated regression tests)",
+    "frontend": "80% (desktop/mobile core flows pass; scanner flow fails)"
+  },
+  "seed_data_creation": "No new seed data created. Existing six imported registrations and existing scan activity were used.",
+  "retest_needed": true,
+  "should_call_test_agent_after_fix": true,
+  "context_for_next_testing_agent": "Login, dashboard metrics/activity, registrations search, pass generation feedback, invalid QR API response, and mobile no-overflow were verified. Re-test scanner startup with camera permission denied and allowed, then verify valid QR and duplicate UI outcomes. CSV preview/import and valid/duplicate API scan flow were previously manually verified by the prior agent but not repeated in this iteration.",
+  "rca of the issue": "On /scanner, Html5Qrcode.start({facingMode:'environment'}, ...) rejects in the browser environment. The effect cleanup immediately invokes qr.stop() regardless of whether start completed; html5-qrcode rejects stop with 'Cannot stop, scanner is not running or paused', which escapes the cleanup and triggers the React runtime error overlay. Mitigate with a started ref/state and catch/ignore cleanup rejection, while rendering the existing CAMERA_ERROR result instead of allowing an uncaught exception."
+}
