@@ -85,12 +85,38 @@ function Shell({ children }) {
   </aside><main className="content">{children}</main></div>;
 }
 
+function useEntryChime() {
+  const audioRef = useRef(null);
+  const [muted, setMuted] = useState(() => localStorage.getItem("euphoria_chime_muted") === "1");
+  useEffect(() => { localStorage.setItem("euphoria_chime_muted", muted ? "1" : "0"); }, [muted]);
+  function play() {
+    if (muted) return;
+    try {
+      if (!audioRef.current) { const Ctx = window.AudioContext || window.webkitAudioContext; if (!Ctx) return; audioRef.current = new Ctx(); }
+      const ctx = audioRef.current; if (ctx.state === "suspended") ctx.resume();
+      const now = ctx.currentTime;
+      [[988, 0], [1319, 0.12]].forEach(([freq, delay]) => {
+        const osc = ctx.createOscillator(); const gain = ctx.createGain();
+        osc.type = "sine"; osc.frequency.value = freq;
+        gain.gain.setValueAtTime(0, now + delay);
+        gain.gain.linearRampToValueAtTime(0.18, now + delay + 0.02);
+        gain.gain.exponentialRampToValueAtTime(0.0001, now + delay + 0.55);
+        osc.connect(gain).connect(ctx.destination);
+        osc.start(now + delay); osc.stop(now + delay + 0.6);
+      });
+    } catch (_) {}
+  }
+  return { play, muted, setMuted };
+}
+
 function Dashboard() {
   const [stats, setStats] = useState({});
   const [entries, setEntries] = useState([]);
   const [newIds, setNewIds] = useState(new Set());
   const [paused, setPaused] = useState(false);
   const cursor = useRef(null);
+  const firstLoad = useRef(true);
+  const chime = useEntryChime();
   useEffect(() => {
     let cancelled = false;
     async function tick() {
@@ -107,17 +133,19 @@ function Dashboard() {
           setEntries(prev => [...e.data, ...prev].slice(0, 60));
           setNewIds(freshIds);
           cursor.current = e.data[0].scanned_at;
+          if (!firstLoad.current) chime.play();
+          firstLoad.current = false;
           setTimeout(() => { if (!cancelled) setNewIds(new Set()); }, 2500);
         } else if (!cursor.current) {
           const initial = await client.get("/dashboard/live-entries?limit=30", { headers: headers() });
-          if (!cancelled) { setEntries(initial.data); if (initial.data.length) cursor.current = initial.data[0].scanned_at; }
+          if (!cancelled) { setEntries(initial.data); if (initial.data.length) cursor.current = initial.data[0].scanned_at; firstLoad.current = false; }
         }
       } catch (_) {}
     }
     tick();
     const id = setInterval(tick, 3000);
     return () => { cancelled = true; clearInterval(id); };
-  }, [paused]);
+  }, [paused]); // eslint-disable-line react-hooks/exhaustive-deps
   const now = new Date(); const day = now.toLocaleDateString([], { weekday: "long" }).toUpperCase();
   return <Shell>
     <header className="topbar"><div><p className="eyebrow">{day} · OPERATIONS</p><h1>Live gate <em>console.</em></h1></div><Link className="primary compact" data-testid="open-scanner-button" to="/scanner-users">Manage scanners ↗</Link></header>
@@ -131,6 +159,7 @@ function Dashboard() {
     <section className="section-heading">
       <div><p className="eyebrow">LIVE GATE STREAM</p><h2>Scans, as they happen</h2></div>
       <div className="live-controls">
+        <button className="ghost compact icon-btn" data-testid="chime-toggle" title={chime.muted ? "Chime is muted — click to enable" : "Chime is on — click to mute"} onClick={() => chime.setMuted(m => !m)}>{chime.muted ? "🔇 Muted" : "🔔 Chime"}</button>
         <span className={`live-pill ${paused ? "paused" : ""}`} data-testid="live-indicator"><i /> {paused ? "PAUSED" : "LIVE"}</span>
         <button className="ghost compact" data-testid="live-toggle" onClick={() => setPaused(p => !p)}>{paused ? "Resume" : "Pause"}</button>
       </div>
@@ -164,12 +193,6 @@ function Registrations() {
   async function load(q = search) { const r = await client.get(`/registrations?page=1&page_size=50&search=${encodeURIComponent(q)}`, { headers: headers() }); setData(r.data); setSelected(new Set()); }
   useEffect(() => { load(""); }, []); // eslint-disable-line react-hooks/exhaustive-deps
   async function generate(id) { setError(""); try { const r = await client.post(`/passes/${id}/generate`, {}, { headers: headers() }); setMessage(`Pass ready · QR ending ${r.data.pass.qr_token_last4}`); await load(); } catch (e) { setError(errorText(e)); } }
-  async function downloadPdf(passId, regNo) {
-    try { const r = await client.get(`/passes/${passId}/pdf`, { headers: headers(), responseType: "blob" });
-      const url = URL.createObjectURL(new Blob([r.data], { type: "application/pdf" }));
-      const a = document.createElement("a"); a.href = url; a.download = `euphoria-${regNo}.pdf`; a.click(); URL.revokeObjectURL(url);
-    } catch (e) { setError(errorText(e)); }
-  }
   async function saveParticipant(e) {
     e.preventDefault(); setSaving(true); setError(""); setMessage("");
     try {
@@ -213,7 +236,7 @@ function Registrations() {
         <td>{row.last_sent_at ? <span className="badge green" title={new Date(row.last_sent_at).toLocaleString()}>SENT</span> : row.last_send_status === "FAILED" ? <span className="badge red-badge">FAILED</span> : <span className="badge muted-badge">—</span>}</td>
         <td className="row-actions">
           {row.pass_id
-            ? <button className="table-action" data-testid={`download-pdf-${row.id}`} onClick={() => downloadPdf(row.pass_id, row.registration_number)}>Download PDF ↓</button>
+            ? <span className="table-hint muted">Pass ready · emailed on send</span>
             : <button className="table-action" data-testid={`generate-pass-${row.id}`} onClick={() => generate(row.id)}>Generate pass</button>}
         </td>
       </tr>)}
