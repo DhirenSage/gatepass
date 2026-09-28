@@ -45,6 +45,8 @@ def test_login_and_me(api, token):
 def test_invalid_login_and_missing_auth(api):
     bad = api.post(f"{BASE_URL}/api/auth/login", json={"email": ADMIN_EMAIL, "password": "wrong-password"})
     assert bad.status_code == 401
+    # Remove the valid login cookie retained by the module-scoped session before testing missing auth.
+    api.cookies.clear()
     missing = api.get(f"{BASE_URL}/api/dashboard/stats")
     assert missing.status_code == 401
 

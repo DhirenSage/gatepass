@@ -25,7 +25,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, EmailStr, Field
 from pymongo.errors import DuplicateKeyError
+from PIL import Image, ImageDraw
 from reportlab.lib.pagesizes import A4
+from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 
 ROOT_DIR = Path(__file__).parent
@@ -64,6 +66,11 @@ class RegistrationInput(BaseModel):
 class ScanInput(BaseModel):
     token: str = Field(min_length=8, max_length=512)
 
+class ScannerUserInput(BaseModel):
+    username: str = Field(min_length=3)
+    display_name: str = Field(min_length=2)
+    password: str = Field(min_length=8)
+
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
@@ -71,6 +78,8 @@ def public(doc: dict):
     result = dict(doc)
     result.pop("_id", None)
     result.pop("password_hash", None)
+    result.pop("qr_token", None)
+    result.pop("qr_token_encrypted", None)
     return result
 
 def hash_password(value: str) -> str:
@@ -163,6 +172,13 @@ async def logout(response: Response, user=Depends(current_user)):
 async def events(user=Depends(current_user)):
     return [public(x) async for x in db.events.find({}, {"_id": 0}).sort("created_at", -1)]
 
+@api.get("/events/current")
+async def current_event(user=Depends(current_user)):
+    event = await db.events.find_one({"status": {"$in": ["ACTIVE", "DRAFT"]}}, {"_id": 0})
+    if not event:
+        raise HTTPException(404, "No event configured")
+    return public(event)
+
 @api.put("/events/{event_id}")
 async def update_event(event_id: str, body: EventInput, user=Depends(admin_user)):
     data = body.model_dump(); data["updated_at"] = now_iso()
@@ -181,6 +197,7 @@ async def registrations(page: int = Query(1, ge=1), page_size: int = Query(20, g
         p = await db.event_passes.find_one({"registration_id": row["id"]}, {"_id": 0})
         entry = await db.entries.find_one({"registration_id": row["id"]}, {"_id": 0})
         row["pass_status"] = p.get("pass_status", "NOT_GENERATED") if p else "NOT_GENERATED"
+        row["pass_id"] = p.get("id") if p else None
         row["entry_status"] = "ENTERED" if entry else "NOT_ENTERED"
         row["entry_time"] = entry.get("scanned_at") if entry else None
     return {"items": rows, "total": total, "page": page, "page_size": page_size}
@@ -264,10 +281,99 @@ async def generate_pass(registration_id: str, user=Depends(admin_user)):
     registration = await db.registrations.find_one({"id": registration_id}, {"_id": 0})
     if not registration: raise HTTPException(404, "Registration not found")
     existing = await db.event_passes.find_one({"registration_id": registration_id}, {"_id": 0})
-    if existing: return {"pass": existing, "qr_image": qr_data(existing["qr_token"])}
-    raw = secrets.token_urlsafe(32); doc = {"id": str(uuid.uuid4()), "registration_id": registration_id, "event_id": registration.get("event_id"), "qr_token": raw, "qr_token_hash": hashlib.sha256(raw.encode()).hexdigest(), "qr_token_last4": raw[-4:], "pass_status": "ACTIVE", "generated_at": now_iso(), "created_at": now_iso(), "updated_at": now_iso()}
+    if existing:
+        return {"pass": public(existing), "message": "Pass already exists; QR was not regenerated."}
+    raw = secrets.token_urlsafe(32); doc = {"id": str(uuid.uuid4()), "registration_id": registration_id, "event_id": registration.get("event_id"), "qr_token_encrypted": raw, "qr_token_hash": hashlib.sha256(raw.encode()).hexdigest(), "qr_token_last4": raw[-4:], "pass_status": "ACTIVE", "generated_at": now_iso(), "created_at": now_iso(), "updated_at": now_iso()}
     await db.event_passes.insert_one(doc); await audit(user, "PASS_GENERATED", "pass", doc["id"])
-    return {"pass": public(doc), "qr_image": qr_data(raw)}
+    return {"pass": public(doc), "qr_image": qr_data(raw), "message": "Pass generated. Download the PDF or send it by email."}
+
+FESTIVAL_STOPS = [(0.0, (28, 12, 60)), (0.28, (110, 24, 118)), (0.5, (204, 46, 118)), (0.72, (238, 108, 96)), (0.88, (248, 176, 96)), (1.0, (254, 226, 148))]
+
+def _festival_gradient(width=595, height=842):
+    img = Image.new("RGB", (width, height)); draw = ImageDraw.Draw(img)
+    for y in range(height):
+        t = y / (height - 1); color = FESTIVAL_STOPS[-1][1]
+        for i in range(len(FESTIVAL_STOPS) - 1):
+            a, b = FESTIVAL_STOPS[i], FESTIVAL_STOPS[i + 1]
+            if a[0] <= t <= b[0]:
+                p = (t - a[0]) / max(b[0] - a[0], 1e-9); color = tuple(int(a[1][k] + (b[1][k] - a[1][k]) * p) for k in range(3)); break
+        draw.line([(0, y), (width, y)], fill=color)
+    for _ in range(120):
+        import random; x, y = random.randint(0, width), random.randint(0, height); r = random.randint(1, 3); draw.ellipse([x, y, x + r, y + r], fill=(255, 255, 255, 200))
+    return img
+
+@api.get("/passes/{pass_id}/pdf")
+async def pass_pdf(pass_id: str, user=Depends(admin_user)):
+    pass_doc = await db.event_passes.find_one({"id": pass_id}, {"_id": 0})
+    if not pass_doc or pass_doc.get("pass_status") != "ACTIVE":
+        raise HTTPException(404, "Active pass not found")
+    registration = await db.registrations.find_one({"id": pass_doc["registration_id"]}, {"_id": 0})
+    raw = pass_doc.get("qr_token_encrypted") or pass_doc.get("qr_token")
+    qr = qrcode.make(raw); qr_buffer = io.BytesIO(); qr.save(qr_buffer, format="PNG"); qr_buffer.seek(0)
+    bg = _festival_gradient(); bg_buffer = io.BytesIO(); bg.save(bg_buffer, format="PNG"); bg_buffer.seek(0)
+    output = io.BytesIO(); pdf = canvas.Canvas(output, pagesize=A4); pdf.setTitle("EUPHORIA Mega Event Pass")
+    W, H = A4
+    pdf.drawImage(ImageReader(bg_buffer), 0, 0, width=W, height=H)
+    pdf.setFillColorRGB(0.03, 0.02, 0.08); pdf.setFillAlpha(0.55); pdf.rect(0, H - 108, W, 108, fill=1, stroke=0); pdf.setFillAlpha(1)
+    pdf.setFillColorRGB(1, 1, 1); pdf.setFont("Helvetica-Bold", 36); pdf.drawString(42, H - 60, "EUPHORIA")
+    pdf.setFillColorRGB(1, 0.86, 0.42); pdf.setFont("Helvetica-Bold", 10); pdf.drawString(44, H - 78, "MEGA EVENT  ·  OFFICIAL ENTRY PASS  ·  2026")
+    pdf.setFillColorRGB(1, 1, 1); pdf.setFont("Helvetica-Bold", 11); pdf.drawRightString(W - 42, H - 58, registration["registration_number"])
+    pdf.setFillColorRGB(1, 0.9, 0.7); pdf.setFont("Helvetica", 8); pdf.drawRightString(W - 42, H - 74, "REGISTRATION ID")
+    pdf.setFillColorRGB(1, 1, 1); pdf.setFillAlpha(0.85); pdf.setFont("Helvetica", 9); pdf.drawString(42, H - 150, "PARTICIPANT"); pdf.setFillAlpha(1)
+    pdf.setFillColorRGB(1, 1, 1); pdf.setFont("Helvetica-Bold", 30); pdf.drawString(42, H - 185, registration["participant_full_name"][:34])
+    pdf.setFillColorRGB(1, 1, 1); pdf.setFillAlpha(0.85); pdf.setFont("Helvetica", 9); pdf.drawString(42, H - 235, "EVENT"); pdf.setFillAlpha(1)
+    pdf.setFillColorRGB(1, 1, 1); pdf.setFont("Helvetica-Bold", 17); pdf.drawString(42, H - 258, registration["event_name"][:42])
+    pdf.setFillColorRGB(1, 1, 1); pdf.setFillAlpha(0.85); pdf.setFont("Helvetica", 9); pdf.drawString(42, H - 290, "CATEGORY"); pdf.setFillAlpha(1)
+    pdf.setFillColorRGB(0.05, 0.03, 0.12); pdf.setFillAlpha(0.35); pdf.roundRect(42, H - 322, 160, 26, 4, fill=1, stroke=0); pdf.setFillAlpha(1)
+    pdf.setFillColorRGB(1, 0.88, 0.48); pdf.setFont("Helvetica-Bold", 12); pdf.drawString(52, H - 315, registration["event_category"][:24])
+    pdf.setFillColorRGB(1, 1, 1); pdf.roundRect(42, 175, W - 84, 335, 16, fill=1, stroke=0)
+    pdf.setFillColorRGB(0.06, 0.03, 0.14); pdf.setFont("Helvetica-Bold", 15); pdf.drawCentredString(W / 2, 470, "SCAN AT ENTRY GATE")
+    pdf.setFillColorRGB(0.48, 0.22, 0.58); pdf.setFont("Helvetica", 9); pdf.drawCentredString(W / 2, 452, "PRESENT THIS QR TO ANY EUPHORIA SCANNER OPERATOR")
+    pdf.drawImage(ImageReader(qr_buffer), (W - 220) / 2, 224, width=220, height=220)
+    pdf.setFillColorRGB(0.32, 0.14, 0.44); pdf.setFont("Helvetica", 8); pdf.drawCentredString(W / 2, 205, "One scan only  ·  Do not share this pass  ·  Server-verified")
+    pdf.setFillColorRGB(0.03, 0.02, 0.08); pdf.setFillAlpha(0.5); pdf.rect(0, 0, W, 148, fill=1, stroke=0); pdf.setFillAlpha(1)
+    pdf.setFillColorRGB(1, 0.88, 0.48); pdf.setFont("Helvetica-Bold", 10); pdf.drawString(42, 118, "ENTRY INSTRUCTIONS")
+    pdf.setFillColorRGB(1, 0.96, 0.86); pdf.setFont("Helvetica", 9)
+    for i, line in enumerate(["Arrive at the EUPHORIA entry gate with this pass ready on your device or printed.", "Present the QR code to any scanner operator — verification is instant and server-side.", "This QR is valid for a single entry only. Sharing invalidates the pass automatically.", "Doors close at the announced start time. No re-entry without staff approval."]):
+        pdf.drawString(42, 96 - i * 14, "•  " + line)
+    pdf.setFillColorRGB(1, 1, 1); pdf.setFillAlpha(0.55); pdf.setFont("Helvetica", 8); pdf.drawString(42, 22, "EUPHORIA 2026  ·  mega event operations"); pdf.drawRightString(W - 42, 22, "euphoria-entry.system"); pdf.setFillAlpha(1)
+    pdf.showPage(); pdf.save(); output.seek(0)
+    await audit(user, "PASS_PDF_DOWNLOADED", "pass", pass_id)
+    return Response(content=output.getvalue(), media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="euphoria-{registration["registration_number"]}.pdf"'})
+
+@api.post("/passes/{pass_id}/send")
+async def send_pass(pass_id: str, user=Depends(admin_user)):
+    pass_doc = await db.event_passes.find_one({"id": pass_id}, {"_id": 0}); registration = await db.registrations.find_one({"id": pass_doc["registration_id"]}, {"_id": 0}) if pass_doc else None
+    if not pass_doc or not registration: raise HTTPException(404, "Pass not found")
+    log_doc = {"id": str(uuid.uuid4()), "registration_id": registration["id"], "recipient_email": registration["email"], "email_type": "PASS_SENT", "status": "FAILED", "created_at": now_iso()}
+    smtp_ready = all(os.environ.get(key) for key in ["SMTP_HOST", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD", "SMTP_FROM_EMAIL", "SMTP_FROM_NAME"])
+    if not smtp_ready:
+        log_doc["error_message"] = "SMTP is not configured on the backend"
+        await db.email_logs.insert_one(log_doc)
+        raise HTTPException(503, "SMTP is not configured. Add backend SMTP settings before sending passes.")
+    raw = pass_doc.get("qr_token_encrypted") or pass_doc.get("qr_token"); pdf_response = await pass_pdf(pass_id, user); message = EmailMessage(); message["From"] = formataddr((os.environ["SMTP_FROM_NAME"], os.environ["SMTP_FROM_EMAIL"])); message["To"] = registration["email"]; message["Subject"] = "Your EUPHORIA Event Entry Pass"; message.set_content(f"Hello {registration['participant_full_name']},\n\nYour EUPHORIA event entry pass is attached. Please bring it to the event.")
+    message.add_attachment(pdf_response.body, maintype="application", subtype="pdf", filename="euphoria-entry-pass.pdf")
+    try:
+        port = int(os.environ["SMTP_PORT"]); context = ssl.create_default_context()
+        if port == 465:
+            with smtplib.SMTP_SSL(os.environ["SMTP_HOST"], port, context=context, timeout=20) as smtp: smtp.login(os.environ["SMTP_USERNAME"], os.environ["SMTP_PASSWORD"]); smtp.send_message(message)
+        else:
+            with smtplib.SMTP(os.environ["SMTP_HOST"], port, timeout=20) as smtp: smtp.ehlo(); smtp.starttls(context=context); smtp.login(os.environ["SMTP_USERNAME"], os.environ["SMTP_PASSWORD"]); smtp.send_message(message)
+        log_doc["status"] = "SENT"; log_doc["sent_at"] = now_iso(); await db.event_passes.update_one({"id": pass_id}, {"$set": {"last_sent_at": now_iso()}})
+    except Exception as exc:
+        log_doc["error_message"] = type(exc).__name__; await db.email_logs.insert_one(log_doc); raise HTTPException(502, "Email delivery failed; the pass was not marked as sent.")
+    await db.email_logs.insert_one(log_doc); await audit(user, "PASS_SENT", "pass", pass_id); return {"success": True, "status": "SENT"}
+
+@api.get("/scanner-users")
+async def scanner_users(user=Depends(admin_user)):
+    return [public(x) async for x in db.users.find({"role": "SCANNER"}, {"_id": 0}).sort("created_at", -1)]
+
+@api.post("/scanner-users")
+async def create_scanner_user(body: ScannerUserInput, user=Depends(admin_user)):
+    doc = {"id": str(uuid.uuid4()), "username": body.username.lower(), "email": f"{body.username.lower()}@scanner.euphoria.local", "display_name": body.display_name, "password_hash": hash_password(body.password), "role": "SCANNER", "is_active": True, "created_at": now_iso(), "updated_at": now_iso()}
+    try: await db.users.insert_one(doc)
+    except DuplicateKeyError: raise HTTPException(409, "Scanner username already exists")
+    await audit(user, "SCANNER_USER_CREATED", "user", doc["id"]); return public(doc)
 
 @api.get("/dashboard/stats")
 async def dashboard(user=Depends(admin_user)):

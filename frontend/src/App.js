@@ -20,8 +20,76 @@ function Shell({ children }) { const navigate = useNavigate(); const user = JSON
 function Dashboard() { const [stats, setStats] = useState({}); const [activity, setActivity] = useState([]); useEffect(() => { Promise.all([client.get("/dashboard/stats", { headers: headers() }), client.get("/dashboard/recent-scans", { headers: headers() })]).then(([a, b]) => { setStats(a.data); setActivity(b.data); }); }, []); return <Shell><header className="topbar"><div><p className="eyebrow">TUESDAY · OPERATIONS</p><h1>Good morning, <em>team.</em></h1></div><Link className="primary compact" data-testid="open-scanner-button" to="/scanner">Open scanner ↗</Link></header><section className="hero-band"><div><p className="eyebrow cyan">EUPHORIA 2026</p><h2>Entry, <span>in rhythm.</span></h2><p className="muted">One gate. Multiple operators. Zero duplicate entries.</p></div><div className="hero-orbit">E<span>•</span></div></section><div className="metric-grid"><Metric label="Registered" value={stats.total_registrations ?? "—"} tone="cyan"/><Metric label="Entered today" value={stats.entries_today ?? "—"} tone="green"/><Metric label="Entry rate" value={`${stats.entry_percentage ?? 0}%`} tone="gold"/><Metric label="Duplicate attempts" value={stats.duplicate_attempts ?? "—"} tone="red"/></div><section className="section-heading"><div><p className="eyebrow">LIVE ACTIVITY</p><h2>Recent scans</h2></div><span className="live-pill"><i /> LIVE</span></section><div className="activity-list">{activity.length ? activity.map((item, i) => <div className="activity-row" key={item.id || i} data-testid={`activity-row-${i}`}><span className={`scan-icon ${item.status === "ENTRY_ALLOWED" ? "ok" : "warn"}`}>{item.status === "ENTRY_ALLOWED" ? "✓" : "!"}</span><div><strong>{item.message}</strong><small>{item.registration_id || item.token_fingerprint}</small></div><time>{new Date(item.attempted_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><b className={item.status === "ENTRY_ALLOWED" ? "text-green" : "text-gold"}>{item.status.replaceAll("_", " ")}</b></div>) : <div className="empty">No scans yet. The gate is ready.</div>}</div></Shell>; }
 function Metric({ label, value, tone }) { return <div className={`metric ${tone}`} data-testid={`metric-${label.toLowerCase().replaceAll(" ", "-")}`}><small>{label}</small><strong>{value}</strong><span>system count</span></div>; }
 
-function Registrations() { const [data, setData] = useState({ items: [], total: 0 }); const [search, setSearch] = useState(""); const [message, setMessage] = useState(""); async function load(q = search) { const r = await client.get(`/registrations?page=1&page_size=50&search=${encodeURIComponent(q)}`, { headers: headers() }); setData(r.data); } // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => { load(""); }, []); async function generate(id) { const r = await client.post(`/passes/${id}/generate`, {}, { headers: headers() }); setMessage(`Pass ready · QR ending ${r.data.pass.qr_token_last4}`); load(); } return <Shell><PageTitle eyebrow="PARTICIPANTS" title="Registrations" action={<Link className="primary compact" data-testid="import-csv-link" to="/import">Import CSV ↥</Link>} /><div className="toolbar"><input data-testid="registration-search-input" placeholder="Search name, registration, email or phone" value={search} onChange={e => { setSearch(e.target.value); load(e.target.value); }} /><span>{data.total} records</span></div>{message && <div className="alert success" data-testid="registration-success">{message}</div>}<div className="table-wrap"><table><thead><tr><th>Registration</th><th>Participant</th><th>Event</th><th>Category</th><th>Pass</th><th>Entry</th><th>Action</th></tr></thead><tbody>{data.items.map(row => <tr key={row.id} data-testid={`registration-row-${row.id}`}><td className="mono">{row.registration_number}</td><td><strong>{row.participant_full_name}</strong><small>{row.email}</small></td><td>{row.event_name}</td><td><span className="tag">{row.event_category}</span></td><td><span className={`badge ${row.pass_status === "ACTIVE" ? "green" : "muted-badge"}`}>{row.pass_status}</span></td><td><span className={`badge ${row.entry_status === "ENTERED" ? "green" : "muted-badge"}`}>{row.entry_status}</span></td><td><button className="table-action" data-testid={`generate-pass-${row.id}`} onClick={() => generate(row.id)}>Generate pass</button></td></tr>)}</tbody></table>{!data.items.length && <div className="empty">No participants match this search.</div>}</div></Shell>; }
+const EMPTY_PARTICIPANT = { registration_number: "", participant_full_name: "", email: "", phone: "", event_name: "EUPHORIA 2026", event_category: "GENERAL" };
+
+function Registrations() {
+  const [data, setData] = useState({ items: [], total: 0 });
+  const [search, setSearch] = useState("");
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const [showAdd, setShowAdd] = useState(false);
+  const [form, setForm] = useState(EMPTY_PARTICIPANT);
+  const [saving, setSaving] = useState(false);
+  async function load(q = search) { const r = await client.get(`/registrations?page=1&page_size=50&search=${encodeURIComponent(q)}`, { headers: headers() }); setData(r.data); }
+  useEffect(() => { load(""); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  async function generate(id) { setError(""); try { const r = await client.post(`/passes/${id}/generate`, {}, { headers: headers() }); setMessage(`Pass ready · QR ending ${r.data.pass.qr_token_last4}`); await load(); } catch (e) { setError(errorText(e)); } }
+  async function downloadPdf(passId, regNo) {
+    try { const r = await client.get(`/passes/${passId}/pdf`, { headers: headers(), responseType: "blob" });
+      const url = URL.createObjectURL(new Blob([r.data], { type: "application/pdf" }));
+      const a = document.createElement("a"); a.href = url; a.download = `euphoria-${regNo}.pdf`; a.click(); URL.revokeObjectURL(url);
+    } catch (e) { setError(errorText(e)); }
+  }
+  async function saveParticipant(e) {
+    e.preventDefault(); setSaving(true); setError(""); setMessage("");
+    try {
+      const created = await client.post("/registrations", form, { headers: headers() });
+      const genRes = await client.post(`/passes/${created.data.id}/generate`, {}, { headers: headers() });
+      setShowAdd(false); setForm(EMPTY_PARTICIPANT);
+      setMessage(`${created.data.participant_full_name} added · Pass ready · QR ending ${genRes.data.pass.qr_token_last4}`);
+      await load();
+    } catch (e2) { setError(errorText(e2)); }
+    finally { setSaving(false); }
+  }
+  return <Shell>
+    <PageTitle eyebrow="PARTICIPANTS" title="Registrations" action={<div className="header-actions"><Link className="ghost compact" data-testid="import-csv-link" to="/import">Import CSV ↥</Link><button className="primary compact" data-testid="add-participant-button" onClick={() => { setShowAdd(true); setError(""); }}>+ Add participant</button></div>} />
+    <div className="toolbar"><input data-testid="registration-search-input" placeholder="Search name, registration, email or phone" value={search} onChange={e => { setSearch(e.target.value); load(e.target.value); }} /><span>{data.total} records</span></div>
+    {message && <div className="alert success" data-testid="registration-success">{message}</div>}
+    {error && <div className="alert danger" data-testid="registration-error">{error}</div>}
+    <div className="table-wrap"><table><thead><tr><th>Registration</th><th>Participant</th><th>Event</th><th>Category</th><th>Pass</th><th>Entry</th><th>Actions</th></tr></thead><tbody>
+      {data.items.map(row => <tr key={row.id} data-testid={`registration-row-${row.id}`}>
+        <td className="mono">{row.registration_number}</td>
+        <td><strong>{row.participant_full_name}</strong><small>{row.email}</small></td>
+        <td>{row.event_name}</td>
+        <td><span className="tag">{row.event_category}</span></td>
+        <td><span className={`badge ${row.pass_status === "ACTIVE" ? "green" : "muted-badge"}`}>{row.pass_status}</span></td>
+        <td><span className={`badge ${row.entry_status === "ENTERED" ? "green" : "muted-badge"}`}>{row.entry_status}</span></td>
+        <td className="row-actions">
+          {row.pass_id
+            ? <button className="table-action" data-testid={`download-pdf-${row.id}`} onClick={() => downloadPdf(row.pass_id, row.registration_number)}>Download PDF ↓</button>
+            : <button className="table-action" data-testid={`generate-pass-${row.id}`} onClick={() => generate(row.id)}>Generate pass</button>}
+        </td>
+      </tr>)}
+    </tbody></table>{!data.items.length && <div className="empty">No participants match this search.</div>}</div>
+    {showAdd && <div className="modal-overlay" data-testid="add-participant-modal" onClick={() => !saving && setShowAdd(false)}>
+      <form className="modal-card" onClick={e => e.stopPropagation()} onSubmit={saveParticipant}>
+        <div className="modal-head"><p className="eyebrow cyan">SINGLE ENTRY</p><h2>Add participant</h2><p className="muted">Creates the registration and generates a fresh EUPHORIA pass instantly.</p></div>
+        <div className="modal-grid">
+          <label>Registration number<input data-testid="add-reg-number" required value={form.registration_number} onChange={e => setForm({ ...form, registration_number: e.target.value })} /></label>
+          <label>Participant full name<input data-testid="add-full-name" required value={form.participant_full_name} onChange={e => setForm({ ...form, participant_full_name: e.target.value })} /></label>
+          <label>Email<input data-testid="add-email" required type="email" value={form.email} onChange={e => setForm({ ...form, email: e.target.value })} /></label>
+          <label>Phone<input data-testid="add-phone" required value={form.phone} onChange={e => setForm({ ...form, phone: e.target.value })} /></label>
+          <label>Event name<input data-testid="add-event-name" required value={form.event_name} onChange={e => setForm({ ...form, event_name: e.target.value })} /></label>
+          <label>Event category<input data-testid="add-event-category" required value={form.event_category} onChange={e => setForm({ ...form, event_category: e.target.value })} /></label>
+        </div>
+        {error && <div className="alert danger" data-testid="add-error">{error}</div>}
+        <div className="modal-actions">
+          <button type="button" className="ghost" data-testid="add-cancel" disabled={saving} onClick={() => setShowAdd(false)}>Cancel</button>
+          <button type="submit" className="primary" data-testid="add-save" disabled={saving}>{saving ? "Saving…" : "Save & generate pass"}</button>
+        </div>
+      </form>
+    </div>}
+  </Shell>;
+}
 
 function PageTitle({ eyebrow, title, action }) { return <header className="topbar"><div><p className="eyebrow">{eyebrow}</p><h1>{title}</h1></div>{action}</header>; }
 
