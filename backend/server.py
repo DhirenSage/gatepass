@@ -102,6 +102,7 @@ async def current_user(request: Request, authorization: Optional[str] = Header(d
     authorization = authorization or (f"Bearer {request.cookies.get('access_token')}" if request.cookies.get("access_token") else None)
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(401, "Authentication required")
+    user = None
     try:
         payload = jwt.decode(authorization[7:], JWT_SECRET, algorithms=[JWT_ALGORITHM])
         user = await db.users.find_one({"id": payload["sub"], "is_active": True}, {"_id": 0})

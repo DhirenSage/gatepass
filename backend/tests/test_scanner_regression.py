@@ -6,8 +6,8 @@ import requests
 
 
 BASE_URL = os.environ["REACT_APP_BACKEND_URL"].rstrip("/")
-ADMIN_EMAIL = "admin@euphoria.local"
-ADMIN_PASSWORD = "EuphoriaAdmin!2026"
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@euphoria.local")
+ADMIN_PASSWORD = os.environ["ADMIN_PASSWORD"]
 
 
 @pytest.fixture(scope="module")

@@ -104,7 +104,7 @@ function useEntryChime() {
         osc.connect(g).connect(ctx.destination);
         osc.start(now + delay); osc.stop(now + delay + dur + 0.05);
       });
-    } catch (_) {}
+    } catch (err) { console.warn("Chime playback skipped:", err); }
   }
   return {
     playSuccess: () => tone([{ freq: 988 }, { freq: 1319, delay: 0.12 }]),
@@ -157,7 +157,7 @@ function Dashboard() {
           if (!cancelled) { setAlerts(initA.data); if (initA.data.length) alertCursor.current = initA.data[0].attempted_at; }
         }
         firstLoad.current = false;
-      } catch (_) {}
+      } catch (err) { console.warn("Dashboard poll failed:", err); }
     }
     tick();
     const id = setInterval(tick, 3000);
@@ -300,7 +300,7 @@ function Registrations() {
           <div className="bulk-stat gold-stat"><small>SKIPPED</small><strong>{sendReport.skipped}</strong></div>
           <div className="bulk-stat cyan-stat"><small>TOTAL</small><strong>{sendReport.total}</strong></div>
         </div>
-        {sendReport.results?.some(r => r.status === "FAILED") && <div className="failed-list"><small>DELIVERY FAILURES</small>{sendReport.results.filter(r => r.status === "FAILED").slice(0, 8).map((r, i) => <div key={i} className="failed-row"><span className="mono">{r.email}</span><span>{r.message}</span></div>)}</div>}
+        {sendReport.results?.some(r => r.status === "FAILED") && <div className="failed-list"><small>DELIVERY FAILURES</small>{sendReport.results.filter(r => r.status === "FAILED").slice(0, 8).map(r => <div key={r.registration_id || r.email} className="failed-row"><span className="mono">{r.email}</span><span>{r.message}</span></div>)}</div>}
         <div className="modal-actions"><button className="primary" data-testid="bulk-report-close" onClick={() => setSendReport(null)}>Done</button></div>
       </div>
     </div>}
