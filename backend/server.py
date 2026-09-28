@@ -31,6 +31,9 @@ from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 
 ROOT_DIR = Path(__file__).parent
+ASSET_DIR = ROOT_DIR / "assets"
+SAGE_LOGO = ASSET_DIR / "sage-naac.png"
+EUPHORIA_LOGO = ASSET_DIR / "euphoria-logo.png"
 mongo_url = os.environ["MONGO_URL"]
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ["DB_NAME"]]
@@ -71,6 +74,10 @@ class ScannerUserInput(BaseModel):
     display_name: str = Field(min_length=2)
     password: str = Field(min_length=8)
 
+class BulkSendInput(BaseModel):
+    registration_ids: list[str] = Field(default_factory=list)
+    scope: str = "SELECTED"
+
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
@@ -110,8 +117,8 @@ async def admin_user(user=Depends(current_user)):
     return user
 
 async def scanner_user(user=Depends(current_user)):
-    if user["role"] not in ("ADMIN", "SCANNER"):
-        raise HTTPException(403, "Scanner access required")
+    if user["role"] != "SCANNER":
+        raise HTTPException(403, "Scanner operators only. Admins cannot scan — please use a scanner account.")
     return user
 
 async def audit(user, action, target_type="system", target_id=None, metadata=None):
@@ -198,6 +205,8 @@ async def registrations(page: int = Query(1, ge=1), page_size: int = Query(20, g
         entry = await db.entries.find_one({"registration_id": row["id"]}, {"_id": 0})
         row["pass_status"] = p.get("pass_status", "NOT_GENERATED") if p else "NOT_GENERATED"
         row["pass_id"] = p.get("id") if p else None
+        row["last_sent_at"] = p.get("last_sent_at") if p else None
+        row["last_send_status"] = p.get("last_send_status") if p else None
         row["entry_status"] = "ENTERED" if entry else "NOT_ENTERED"
         row["entry_time"] = entry.get("scanned_at") if entry else None
     return {"items": rows, "total": total, "page": page, "page_size": page_size}
@@ -308,61 +317,163 @@ async def pass_pdf(pass_id: str, user=Depends(admin_user)):
     if not pass_doc or pass_doc.get("pass_status") != "ACTIVE":
         raise HTTPException(404, "Active pass not found")
     registration = await db.registrations.find_one({"id": pass_doc["registration_id"]}, {"_id": 0})
+    pdf_bytes = await _build_pass_pdf_bytes(pass_doc, registration)
+    await audit(user, "PASS_PDF_DOWNLOADED", "pass", pass_id)
+    return Response(content=pdf_bytes, media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="euphoria-{registration["registration_number"]}.pdf"'})
+
+@api.post("/passes/{pass_id}/send")
+async def send_pass(pass_id: str, user=Depends(admin_user)):
+    pass_doc = await db.event_passes.find_one({"id": pass_id}, {"_id": 0})
+    registration = await db.registrations.find_one({"id": pass_doc["registration_id"]}, {"_id": 0}) if pass_doc else None
+    if not pass_doc or not registration: raise HTTPException(404, "Pass not found")
+    if not _smtp_ready():
+        await db.email_logs.insert_one({"id": str(uuid.uuid4()), "registration_id": registration["id"], "recipient_email": registration["email"], "email_type": "PASS_SENT", "status": "FAILED", "error_message": "SMTP is not configured on the backend", "created_at": now_iso()})
+        raise HTTPException(503, "SMTP is not configured. Add backend SMTP settings before sending passes.")
+    ok, message = await _send_pass_email(pass_doc, registration, user)
+    if not ok: raise HTTPException(502, message)
+    return {"success": True, "status": "SENT"}
+
+@api.post("/passes/bulk-send")
+async def bulk_send_passes(body: BulkSendInput, user=Depends(admin_user)):
+    if not _smtp_ready():
+        raise HTTPException(503, "SMTP is not configured. Add backend SMTP settings before sending passes.")
+    if body.scope == "PENDING_ALL":
+        passes = await db.event_passes.find({"pass_status": "ACTIVE", "$or": [{"last_sent_at": None}, {"last_sent_at": {"$exists": False}}]}, {"_id": 0}).to_list(5000)
+    else:
+        if not body.registration_ids: raise HTTPException(422, "Select at least one participant")
+        passes = await db.event_passes.find({"registration_id": {"$in": body.registration_ids}, "pass_status": "ACTIVE"}, {"_id": 0}).to_list(len(body.registration_ids))
+    sent = failed = skipped = 0; results = []
+    for pass_doc in passes:
+        registration = await db.registrations.find_one({"id": pass_doc["registration_id"]}, {"_id": 0})
+        if not registration or not registration.get("is_active"):
+            skipped += 1; results.append({"registration_id": pass_doc["registration_id"], "status": "SKIPPED", "message": "Registration inactive"}); continue
+        ok, message = await _send_pass_email(pass_doc, registration, user)
+        if ok: sent += 1; results.append({"registration_id": registration["id"], "status": "SENT", "email": registration["email"]})
+        else: failed += 1; results.append({"registration_id": registration["id"], "status": "FAILED", "email": registration["email"], "message": message})
+    await audit(user, "PASS_BULK_SENT", "email", None, {"sent": sent, "failed": failed, "skipped": skipped, "scope": body.scope})
+    return {"total": len(passes), "sent": sent, "failed": failed, "skipped": skipped, "results": results}
+
+def _smtp_ready():
+    return all(os.environ.get(key) for key in ["SMTP_HOST", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD", "SMTP_FROM_EMAIL", "SMTP_FROM_NAME"])
+
+async def _build_pass_pdf_bytes(pass_doc, registration):
     raw = pass_doc.get("qr_token_encrypted") or pass_doc.get("qr_token")
     qr = qrcode.make(raw); qr_buffer = io.BytesIO(); qr.save(qr_buffer, format="PNG"); qr_buffer.seek(0)
     bg = _festival_gradient(); bg_buffer = io.BytesIO(); bg.save(bg_buffer, format="PNG"); bg_buffer.seek(0)
     output = io.BytesIO(); pdf = canvas.Canvas(output, pagesize=A4); pdf.setTitle("EUPHORIA Mega Event Pass")
     W, H = A4
     pdf.drawImage(ImageReader(bg_buffer), 0, 0, width=W, height=H)
-    pdf.setFillColorRGB(0.03, 0.02, 0.08); pdf.setFillAlpha(0.55); pdf.rect(0, H - 108, W, 108, fill=1, stroke=0); pdf.setFillAlpha(1)
-    pdf.setFillColorRGB(1, 1, 1); pdf.setFont("Helvetica-Bold", 36); pdf.drawString(42, H - 60, "EUPHORIA")
-    pdf.setFillColorRGB(1, 0.86, 0.42); pdf.setFont("Helvetica-Bold", 10); pdf.drawString(44, H - 78, "MEGA EVENT  ·  OFFICIAL ENTRY PASS  ·  2026")
-    pdf.setFillColorRGB(1, 1, 1); pdf.setFont("Helvetica-Bold", 11); pdf.drawRightString(W - 42, H - 58, registration["registration_number"])
-    pdf.setFillColorRGB(1, 0.9, 0.7); pdf.setFont("Helvetica", 8); pdf.drawRightString(W - 42, H - 74, "REGISTRATION ID")
-    pdf.setFillColorRGB(1, 1, 1); pdf.setFillAlpha(0.85); pdf.setFont("Helvetica", 9); pdf.drawString(42, H - 150, "PARTICIPANT"); pdf.setFillAlpha(1)
-    pdf.setFillColorRGB(1, 1, 1); pdf.setFont("Helvetica-Bold", 30); pdf.drawString(42, H - 185, registration["participant_full_name"][:34])
-    pdf.setFillColorRGB(1, 1, 1); pdf.setFillAlpha(0.85); pdf.setFont("Helvetica", 9); pdf.drawString(42, H - 235, "EVENT"); pdf.setFillAlpha(1)
-    pdf.setFillColorRGB(1, 1, 1); pdf.setFont("Helvetica-Bold", 17); pdf.drawString(42, H - 258, registration["event_name"][:42])
-    pdf.setFillColorRGB(1, 1, 1); pdf.setFillAlpha(0.85); pdf.setFont("Helvetica", 9); pdf.drawString(42, H - 290, "CATEGORY"); pdf.setFillAlpha(1)
-    pdf.setFillColorRGB(0.05, 0.03, 0.12); pdf.setFillAlpha(0.35); pdf.roundRect(42, H - 322, 160, 26, 4, fill=1, stroke=0); pdf.setFillAlpha(1)
-    pdf.setFillColorRGB(1, 0.88, 0.48); pdf.setFont("Helvetica-Bold", 12); pdf.drawString(52, H - 315, registration["event_category"][:24])
-    pdf.setFillColorRGB(1, 1, 1); pdf.roundRect(42, 175, W - 84, 335, 16, fill=1, stroke=0)
-    pdf.setFillColorRGB(0.06, 0.03, 0.14); pdf.setFont("Helvetica-Bold", 15); pdf.drawCentredString(W / 2, 470, "SCAN AT ENTRY GATE")
-    pdf.setFillColorRGB(0.48, 0.22, 0.58); pdf.setFont("Helvetica", 9); pdf.drawCentredString(W / 2, 452, "PRESENT THIS QR TO ANY EUPHORIA SCANNER OPERATOR")
-    pdf.drawImage(ImageReader(qr_buffer), (W - 220) / 2, 224, width=220, height=220)
-    pdf.setFillColorRGB(0.32, 0.14, 0.44); pdf.setFont("Helvetica", 8); pdf.drawCentredString(W / 2, 205, "One scan only  ·  Do not share this pass  ·  Server-verified")
+    # White top bar hosting the SAGE University + NAAC lockup
+    pdf.setFillColorRGB(1, 1, 1); pdf.rect(0, H - 96, W, 96, fill=1, stroke=0)
+    if SAGE_LOGO.exists():
+        pdf.drawImage(str(SAGE_LOGO), 32, H - 88, width=350, height=78, preserveAspectRatio=True, mask="auto")
+    pdf.setFillColorRGB(0.55, 0.09, 0.13); pdf.setFont("Helvetica-Bold", 10); pdf.drawRightString(W - 40, H - 40, "OFFICIAL ENTRY PASS")
+    pdf.setFillColorRGB(0.4, 0.28, 0.05); pdf.setFont("Helvetica-Bold", 9); pdf.drawRightString(W - 40, H - 56, registration["registration_number"])
+    pdf.setFillColorRGB(0.5, 0.5, 0.55); pdf.setFont("Helvetica", 7); pdf.drawRightString(W - 40, H - 70, "REGISTRATION ID")
+    # EUPHORIA carnival hero logo band
+    if EUPHORIA_LOGO.exists():
+        pdf.drawImage(str(EUPHORIA_LOGO), (W - 260) / 2, H - 260, width=260, height=140, preserveAspectRatio=True, mask="auto")
+    pdf.setFillColorRGB(1, 1, 1); pdf.setFillAlpha(0.9); pdf.setFont("Helvetica-Bold", 11); pdf.drawCentredString(W / 2, H - 275, "MEGA CULTURAL FEST  ·  2026"); pdf.setFillAlpha(1)
+    # Participant panel
+    pdf.setFillColorRGB(1, 1, 1); pdf.setFillAlpha(0.85); pdf.setFont("Helvetica", 9); pdf.drawString(42, H - 320, "PARTICIPANT"); pdf.setFillAlpha(1)
+    pdf.setFillColorRGB(1, 1, 1); pdf.setFont("Helvetica-Bold", 26); pdf.drawString(42, H - 350, registration["participant_full_name"][:34])
+    pdf.setFillColorRGB(1, 1, 1); pdf.setFillAlpha(0.85); pdf.setFont("Helvetica", 9); pdf.drawString(42, H - 388, "EVENT"); pdf.setFillAlpha(1)
+    pdf.setFillColorRGB(1, 1, 1); pdf.setFont("Helvetica-Bold", 15); pdf.drawString(42, H - 408, registration["event_name"][:42])
+    pdf.setFillColorRGB(1, 1, 1); pdf.setFillAlpha(0.85); pdf.setFont("Helvetica", 9); pdf.drawString(300, H - 388, "CATEGORY"); pdf.setFillAlpha(1)
+    pdf.setFillColorRGB(0.05, 0.03, 0.12); pdf.setFillAlpha(0.35); pdf.roundRect(300, H - 416, 200, 24, 4, fill=1, stroke=0); pdf.setFillAlpha(1)
+    pdf.setFillColorRGB(1, 0.88, 0.48); pdf.setFont("Helvetica-Bold", 12); pdf.drawString(310, H - 410, registration["event_category"][:24])
+    # QR white panel
+    pdf.setFillColorRGB(1, 1, 1); pdf.roundRect(42, 175, W - 84, 300, 16, fill=1, stroke=0)
+    pdf.setFillColorRGB(0.06, 0.03, 0.14); pdf.setFont("Helvetica-Bold", 15); pdf.drawCentredString(W / 2, 445, "SCAN AT ENTRY GATE")
+    pdf.setFillColorRGB(0.48, 0.22, 0.58); pdf.setFont("Helvetica", 9); pdf.drawCentredString(W / 2, 427, "PRESENT THIS QR TO ANY EUPHORIA SCANNER OPERATOR")
+    pdf.drawImage(ImageReader(qr_buffer), (W - 205) / 2, 215, width=205, height=205)
+    pdf.setFillColorRGB(0.32, 0.14, 0.44); pdf.setFont("Helvetica", 8); pdf.drawCentredString(W / 2, 198, "One scan only  ·  Do not share this pass  ·  Server-verified")
+    # Footer
     pdf.setFillColorRGB(0.03, 0.02, 0.08); pdf.setFillAlpha(0.5); pdf.rect(0, 0, W, 148, fill=1, stroke=0); pdf.setFillAlpha(1)
     pdf.setFillColorRGB(1, 0.88, 0.48); pdf.setFont("Helvetica-Bold", 10); pdf.drawString(42, 118, "ENTRY INSTRUCTIONS")
     pdf.setFillColorRGB(1, 0.96, 0.86); pdf.setFont("Helvetica", 9)
-    for i, line in enumerate(["Arrive at the EUPHORIA entry gate with this pass ready on your device or printed.", "Present the QR code to any scanner operator — verification is instant and server-side.", "This QR is valid for a single entry only. Sharing invalidates the pass automatically.", "Doors close at the announced start time. No re-entry without staff approval."]):
+    for i, line in enumerate(["Arrive at the SAGE University entry gate with this pass ready on your device or printed.", "Present the QR code to any scanner operator — verification is instant and server-side.", "This QR is valid for a single entry only. Sharing invalidates the pass automatically.", "Doors close at the announced start time. No re-entry without staff approval."]):
         pdf.drawString(42, 96 - i * 14, "•  " + line)
-    pdf.setFillColorRGB(1, 1, 1); pdf.setFillAlpha(0.55); pdf.setFont("Helvetica", 8); pdf.drawString(42, 22, "EUPHORIA 2026  ·  mega event operations"); pdf.drawRightString(W - 42, 22, "euphoria-entry.system"); pdf.setFillAlpha(1)
+    pdf.setFillColorRGB(1, 1, 1); pdf.setFillAlpha(0.55); pdf.setFont("Helvetica", 8); pdf.drawString(42, 22, "SAGE Euphoria 2026  ·  Cultural fest operations"); pdf.drawRightString(W - 42, 22, "sage.university"); pdf.setFillAlpha(1)
     pdf.showPage(); pdf.save(); output.seek(0)
-    await audit(user, "PASS_PDF_DOWNLOADED", "pass", pass_id)
-    return Response(content=output.getvalue(), media_type="application/pdf", headers={"Content-Disposition": f'attachment; filename="euphoria-{registration["registration_number"]}.pdf"'})
+    return output.getvalue()
 
-@api.post("/passes/{pass_id}/send")
-async def send_pass(pass_id: str, user=Depends(admin_user)):
-    pass_doc = await db.event_passes.find_one({"id": pass_id}, {"_id": 0}); registration = await db.registrations.find_one({"id": pass_doc["registration_id"]}, {"_id": 0}) if pass_doc else None
-    if not pass_doc or not registration: raise HTTPException(404, "Pass not found")
-    log_doc = {"id": str(uuid.uuid4()), "registration_id": registration["id"], "recipient_email": registration["email"], "email_type": "PASS_SENT", "status": "FAILED", "created_at": now_iso()}
-    smtp_ready = all(os.environ.get(key) for key in ["SMTP_HOST", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD", "SMTP_FROM_EMAIL", "SMTP_FROM_NAME"])
-    if not smtp_ready:
-        log_doc["error_message"] = "SMTP is not configured on the backend"
-        await db.email_logs.insert_one(log_doc)
-        raise HTTPException(503, "SMTP is not configured. Add backend SMTP settings before sending passes.")
-    raw = pass_doc.get("qr_token_encrypted") or pass_doc.get("qr_token"); pdf_response = await pass_pdf(pass_id, user); message = EmailMessage(); message["From"] = formataddr((os.environ["SMTP_FROM_NAME"], os.environ["SMTP_FROM_EMAIL"])); message["To"] = registration["email"]; message["Subject"] = "Your EUPHORIA Event Entry Pass"; message.set_content(f"Hello {registration['participant_full_name']},\n\nYour EUPHORIA event entry pass is attached. Please bring it to the event.")
-    message.add_attachment(pdf_response.body, maintype="application", subtype="pdf", filename="euphoria-entry-pass.pdf")
+def _html_email_body(registration, event):
+    event_date = event.get("start_date", "") if event else ""
+    end_date = event.get("end_date", "") if event else ""
+    entry_start = event.get("entry_start_time", "") if event else ""
+    entry_end = event.get("entry_end_time", "") if event else ""
+    date_line = f"{event_date}" if event_date == end_date or not end_date else f"{event_date} — {end_date}"
+    time_line = f"{entry_start} – {entry_end}" if entry_start and entry_end else "See event schedule"
+    event_name = registration["event_name"]
+    category = registration["event_category"]
+    return f"""<!doctype html><html><body style="margin:0;padding:0;background:#f1f5f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="background:#f1f5f9"><tbody><tr><td align="center" style="padding:28px 12px">
+<table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:600px;background:#ffffff;border-radius:18px;overflow:hidden;box-shadow:0 12px 40px rgba(15,23,42,.08)">
+<tbody>
+<tr><td style="height:9px;background:#ff007a;background-image:linear-gradient(90deg,#ff007a,#7928ca,#06b6d4,#f59e0b)"></td></tr>
+<tr><td style="padding:24px 28px;background:#ffffff"><table role="presentation" width="100%"><tbody><tr>
+<td valign="middle"><img src="cid:sagelogo" width="150" alt="SAGE University Indore" style="display:block;max-width:150px;height:auto" /></td>
+<td align="right" valign="middle"><img src="cid:euphorialogo" width="120" alt="EUPHORIA" style="display:inline-block;max-width:120px;height:auto" /></td>
+</tr></tbody></table></td></tr>
+<tr><td style="padding:38px 30px;background:#0f172a;color:#ffffff">
+<span style="display:inline-block;padding:7px 11px;border-radius:999px;background:#ff007a;color:#ffffff;font-size:11px;font-weight:bold;letter-spacing:1px">{category.upper()}</span>
+<h1 style="margin:20px 0 10px;font-size:34px;line-height:1.08;letter-spacing:-1px;color:#ffffff">Your EUPHORIA<br>pass is ready!</h1>
+<p style="margin:0;color:#cbd5e1;font-size:16px;line-height:1.65">Hello <strong style="color:#ffffff">{registration["participant_full_name"]}</strong>, your registration is verified. Your complete printable pass is attached to this email.</p>
+</td></tr>
+<tr><td style="padding:28px 30px;background:#ffffff">
+<table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border:1px solid #e2e8f0;border-radius:12px">
+<tbody>
+<tr><td colspan="2" style="padding:18px;background:#f8fafc;border-bottom:1px solid #e2e8f0"><span style="font-size:11px;color:#64748b;letter-spacing:1px">EVENT</span><br><strong style="font-size:20px;line-height:1.4;color:#0f172a">{event_name}</strong></td></tr>
+<tr><td width="50%" style="padding:16px;border-right:1px solid #e2e8f0;border-bottom:1px solid #e2e8f0"><span style="font-size:10px;color:#64748b;letter-spacing:1px">REGISTRATION ID</span><br><strong style="font-size:14px;line-height:1.8;color:#0f172a">{registration["registration_number"]}</strong></td>
+<td width="50%" style="padding:16px;border-bottom:1px solid #e2e8f0"><span style="font-size:10px;color:#64748b;letter-spacing:1px">PASS STATUS</span><br><strong style="font-size:14px;line-height:1.8;color:#047857">COMPLIMENTARY · ACTIVE</strong></td></tr>
+<tr><td width="50%" style="padding:16px;border-right:1px solid #e2e8f0"><span style="font-size:10px;color:#64748b;letter-spacing:1px">DATE</span><br><strong style="font-size:14px;line-height:1.6;color:#0f172a">{date_line or "See invitation"}</strong></td>
+<td width="50%" style="padding:16px"><span style="font-size:10px;color:#64748b;letter-spacing:1px">ENTRY TIME</span><br><strong style="font-size:14px;line-height:1.6;color:#0f172a">{time_line}</strong></td></tr>
+</tbody></table>
+<table role="presentation" width="100%" style="margin-top:22px;background:#fff7ed;border-left:4px solid #f59e0b;border-radius:6px"><tbody><tr><td style="padding:16px 18px;color:#7c2d12;font-size:13px;line-height:1.6"><strong>Complete PDF pass attached</strong><br>The attachment includes participant details, event information, entry instructions and the official scannable QR — not just a QR image.</td></tr></tbody></table>
+<h3 style="margin:28px 0 10px;font-size:16px;color:#0f172a">Gate instructions</h3>
+<ul style="margin:0;padding-left:20px;color:#475569;font-size:13px;line-height:1.8">
+<li>Keep the PDF or digital QR ready before reaching the gate.</li>
+<li>Carry a valid institutional photo ID.</li>
+<li>This pass is non-transferable and valid only for the registered event.</li>
+<li>One entry is permitted per configured event day.</li>
+</ul>
+</td></tr>
+<tr><td style="padding:22px 30px;background:#0f172a;color:#94a3b8;font-size:11px;line-height:1.7;text-align:center">SAGE University Indore · EUPHORIA 2026<br>Need help? Reply to this email or contact the EUPHORIA Event Desk.</td></tr>
+</tbody></table></td></tr></tbody></table></body></html>"""
+
+async def _send_pass_email(pass_doc, registration, actor):
+    log_doc = {"id": str(uuid.uuid4()), "registration_id": registration["id"], "pass_id": pass_doc["id"], "recipient_email": registration["email"], "email_type": "PASS_SENT", "status": "FAILED", "created_at": now_iso()}
     try:
+        event = await db.events.find_one({"status": "ACTIVE"}, {"_id": 0})
+        pdf_bytes = await _build_pass_pdf_bytes(pass_doc, registration)
+        message = EmailMessage()
+        message["From"] = formataddr((os.environ["SMTP_FROM_NAME"], os.environ["SMTP_FROM_EMAIL"]))
+        message["To"] = registration["email"]
+        message["Subject"] = f"Your EUPHORIA {registration['event_name']} entry pass"
+        message.set_content(f"Hello {registration['participant_full_name']},\n\nYour EUPHORIA event entry pass is attached to this email. Please bring it to the gate.\n\nRegistration: {registration['registration_number']}\nEvent: {registration['event_name']}\nCategory: {registration['event_category']}\n\nSee you at SAGE University Indore.")
+        message.add_alternative(_html_email_body(registration, event), subtype="html")
+        html_part = message.get_payload()[-1]
+        if SAGE_LOGO.exists():
+            html_part.add_related(SAGE_LOGO.read_bytes(), maintype="image", subtype="png", cid="<sagelogo>", filename="sage-university.png")
+        if EUPHORIA_LOGO.exists():
+            html_part.add_related(EUPHORIA_LOGO.read_bytes(), maintype="image", subtype="png", cid="<euphorialogo>", filename="euphoria.png")
+        message.add_attachment(pdf_bytes, maintype="application", subtype="pdf", filename=f"euphoria-{registration['registration_number']}.pdf")
         port = int(os.environ["SMTP_PORT"]); context = ssl.create_default_context()
         if port == 465:
             with smtplib.SMTP_SSL(os.environ["SMTP_HOST"], port, context=context, timeout=20) as smtp: smtp.login(os.environ["SMTP_USERNAME"], os.environ["SMTP_PASSWORD"]); smtp.send_message(message)
         else:
             with smtplib.SMTP(os.environ["SMTP_HOST"], port, timeout=20) as smtp: smtp.ehlo(); smtp.starttls(context=context); smtp.login(os.environ["SMTP_USERNAME"], os.environ["SMTP_PASSWORD"]); smtp.send_message(message)
-        log_doc["status"] = "SENT"; log_doc["sent_at"] = now_iso(); await db.event_passes.update_one({"id": pass_id}, {"$set": {"last_sent_at": now_iso()}})
+        log_doc["status"] = "SENT"; log_doc["sent_at"] = now_iso()
+        await db.event_passes.update_one({"id": pass_doc["id"]}, {"$set": {"last_sent_at": now_iso(), "last_send_status": "SENT"}})
+        await db.email_logs.insert_one(log_doc); await audit(actor, "PASS_SENT", "pass", pass_doc["id"])
+        return True, "SENT"
     except Exception as exc:
-        log_doc["error_message"] = type(exc).__name__; await db.email_logs.insert_one(log_doc); raise HTTPException(502, "Email delivery failed; the pass was not marked as sent.")
-    await db.email_logs.insert_one(log_doc); await audit(user, "PASS_SENT", "pass", pass_id); return {"success": True, "status": "SENT"}
+        log_doc["error_message"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+        await db.event_passes.update_one({"id": pass_doc["id"]}, {"$set": {"last_send_status": "FAILED"}})
+        await db.email_logs.insert_one(log_doc)
+        log.exception("Pass email failed for %s", registration.get("registration_number"))
+        return False, log_doc["error_message"]
 
 @api.get("/scanner-users")
 async def scanner_users(user=Depends(admin_user)):
@@ -374,6 +485,51 @@ async def create_scanner_user(body: ScannerUserInput, user=Depends(admin_user)):
     try: await db.users.insert_one(doc)
     except DuplicateKeyError: raise HTTPException(409, "Scanner username already exists")
     await audit(user, "SCANNER_USER_CREATED", "user", doc["id"]); return public(doc)
+
+@api.patch("/scanner-users/{user_id}/toggle")
+async def toggle_scanner_user(user_id: str, user=Depends(admin_user)):
+    target = await db.users.find_one({"id": user_id, "role": "SCANNER"}, {"_id": 0})
+    if not target: raise HTTPException(404, "Scanner user not found")
+    new_state = not target.get("is_active", True)
+    await db.users.update_one({"id": user_id}, {"$set": {"is_active": new_state, "updated_at": now_iso()}})
+    await audit(user, "SCANNER_USER_TOGGLED", "user", user_id, {"is_active": new_state})
+    return {"id": user_id, "is_active": new_state}
+
+@api.post("/scanner-users/{user_id}/reset-password")
+async def reset_scanner_password(user_id: str, body: dict, user=Depends(admin_user)):
+    new_password = str(body.get("password") or "").strip()
+    if len(new_password) < 8: raise HTTPException(422, "Password must be at least 8 characters")
+    target = await db.users.find_one({"id": user_id, "role": "SCANNER"}, {"_id": 0})
+    if not target: raise HTTPException(404, "Scanner user not found")
+    await db.users.update_one({"id": user_id}, {"$set": {"password_hash": hash_password(new_password), "updated_at": now_iso()}})
+    await audit(user, "SCANNER_PASSWORD_RESET", "user", user_id)
+    return {"success": True}
+
+@api.get("/entries")
+async def entries_list(page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200), search: str = "", user=Depends(admin_user)):
+    pipeline = [{"$sort": {"scanned_at": -1}}, {"$lookup": {"from": "registrations", "localField": "registration_id", "foreignField": "id", "as": "reg"}}, {"$unwind": {"path": "$reg", "preserveNullAndEmptyArrays": True}}, {"$lookup": {"from": "users", "localField": "scanner_user_id", "foreignField": "id", "as": "scanner"}}, {"$unwind": {"path": "$scanner", "preserveNullAndEmptyArrays": True}}]
+    if search:
+        rx = {"$regex": search, "$options": "i"}
+        pipeline.append({"$match": {"$or": [{"reg.registration_number": rx}, {"reg.participant_full_name": rx}, {"reg.email": rx}, {"reg.phone": rx}]}})
+    count_pipeline = pipeline + [{"$count": "n"}]
+    count_res = await db.entries.aggregate(count_pipeline).to_list(1)
+    total = count_res[0]["n"] if count_res else 0
+    pipeline.append({"$skip": (page - 1) * page_size}); pipeline.append({"$limit": page_size})
+    pipeline.append({"$project": {"_id": 0, "id": 1, "scanned_at": 1, "server_date": 1, "server_time": 1, "registration_number": "$reg.registration_number", "participant_full_name": "$reg.participant_full_name", "email": "$reg.email", "phone": "$reg.phone", "event_name": "$reg.event_name", "event_category": "$reg.event_category", "scanner_username": "$scanner.username", "scanner_display_name": "$scanner.display_name"}})
+    items = await db.entries.aggregate(pipeline).to_list(page_size)
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+@api.get("/entries/export")
+async def entries_export(user=Depends(admin_user)):
+    pipeline = [{"$sort": {"scanned_at": -1}}, {"$lookup": {"from": "registrations", "localField": "registration_id", "foreignField": "id", "as": "reg"}}, {"$unwind": {"path": "$reg", "preserveNullAndEmptyArrays": True}}, {"$lookup": {"from": "users", "localField": "scanner_user_id", "foreignField": "id", "as": "scanner"}}, {"$unwind": {"path": "$scanner", "preserveNullAndEmptyArrays": True}}]
+    rows = await db.entries.aggregate(pipeline).to_list(50000)
+    buf = io.StringIO(); writer = csv.writer(buf)
+    writer.writerow(["Registration Number", "Participant Name", "Email", "Phone", "Event", "Category", "Entry Date", "Entry Time", "Scanner Operator"])
+    for r in rows:
+        reg = r.get("reg") or {}; sc = r.get("scanner") or {}
+        writer.writerow([reg.get("registration_number", ""), reg.get("participant_full_name", ""), reg.get("email", ""), reg.get("phone", ""), reg.get("event_name", ""), reg.get("event_category", ""), r.get("server_date", ""), r.get("server_time", ""), sc.get("display_name") or sc.get("username", "")])
+    await audit(user, "ENTRIES_EXPORTED", "entry", None, {"count": len(rows)})
+    return Response(content=buf.getvalue(), media_type="text/csv", headers={"Content-Disposition": 'attachment; filename="euphoria-entries.csv"'})
 
 @api.get("/dashboard/stats")
 async def dashboard(user=Depends(admin_user)):
