@@ -85,7 +85,67 @@ function Shell({ children }) {
   </aside><main className="content">{children}</main></div>;
 }
 
-function Dashboard() { const [stats, setStats] = useState({}); const [activity, setActivity] = useState([]); useEffect(() => { Promise.all([client.get("/dashboard/stats", { headers: headers() }), client.get("/dashboard/recent-scans", { headers: headers() })]).then(([a, b]) => { setStats(a.data); setActivity(b.data); }); }, []); return <Shell><header className="topbar"><div><p className="eyebrow">TUESDAY · OPERATIONS</p><h1>Good morning, <em>team.</em></h1></div><Link className="primary compact" data-testid="open-scanner-button" to="/scanner">Open scanner ↗</Link></header><section className="hero-band"><div><p className="eyebrow cyan">EUPHORIA 2026</p><h2>Entry, <span>in rhythm.</span></h2><p className="muted">One gate. Multiple operators. Zero duplicate entries.</p></div><div className="hero-orbit">E<span>•</span></div></section><div className="metric-grid"><Metric label="Registered" value={stats.total_registrations ?? "—"} tone="cyan"/><Metric label="Entered today" value={stats.entries_today ?? "—"} tone="green"/><Metric label="Entry rate" value={`${stats.entry_percentage ?? 0}%`} tone="gold"/><Metric label="Duplicate attempts" value={stats.duplicate_attempts ?? "—"} tone="red"/></div><section className="section-heading"><div><p className="eyebrow">LIVE ACTIVITY</p><h2>Recent scans</h2></div><span className="live-pill"><i /> LIVE</span></section><div className="activity-list">{activity.length ? activity.map((item, i) => <div className="activity-row" key={item.id || i} data-testid={`activity-row-${i}`}><span className={`scan-icon ${item.status === "ENTRY_ALLOWED" ? "ok" : "warn"}`}>{item.status === "ENTRY_ALLOWED" ? "✓" : "!"}</span><div><strong>{item.message}</strong><small>{item.registration_id || item.token_fingerprint}</small></div><time>{new Date(item.attempted_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time><b className={item.status === "ENTRY_ALLOWED" ? "text-green" : "text-gold"}>{item.status.replaceAll("_", " ")}</b></div>) : <div className="empty">No scans yet. The gate is ready.</div>}</div></Shell>; }
+function Dashboard() {
+  const [stats, setStats] = useState({});
+  const [entries, setEntries] = useState([]);
+  const [newIds, setNewIds] = useState(new Set());
+  const [paused, setPaused] = useState(false);
+  const cursor = useRef(null);
+  useEffect(() => {
+    let cancelled = false;
+    async function tick() {
+      if (cancelled || paused) return;
+      try {
+        const [s, e] = await Promise.all([
+          client.get("/dashboard/stats", { headers: headers() }),
+          client.get(`/dashboard/live-entries${cursor.current ? `?since=${encodeURIComponent(cursor.current)}` : ""}`, { headers: headers() }),
+        ]);
+        if (cancelled) return;
+        setStats(s.data);
+        if (e.data.length) {
+          const freshIds = new Set(e.data.map(x => x.id));
+          setEntries(prev => [...e.data, ...prev].slice(0, 60));
+          setNewIds(freshIds);
+          cursor.current = e.data[0].scanned_at;
+          setTimeout(() => { if (!cancelled) setNewIds(new Set()); }, 2500);
+        } else if (!cursor.current) {
+          const initial = await client.get("/dashboard/live-entries?limit=30", { headers: headers() });
+          if (!cancelled) { setEntries(initial.data); if (initial.data.length) cursor.current = initial.data[0].scanned_at; }
+        }
+      } catch (_) {}
+    }
+    tick();
+    const id = setInterval(tick, 3000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [paused]);
+  const now = new Date(); const day = now.toLocaleDateString([], { weekday: "long" }).toUpperCase();
+  return <Shell>
+    <header className="topbar"><div><p className="eyebrow">{day} · OPERATIONS</p><h1>Live gate <em>console.</em></h1></div><Link className="primary compact" data-testid="open-scanner-button" to="/scanner-users">Manage scanners ↗</Link></header>
+    <section className="hero-band"><div><p className="eyebrow cyan">SAGE EUPHORIA 2026</p><h2>Entry, <span>in rhythm.</span></h2><p className="muted">One gate. Multiple operators. Zero duplicate entries.</p></div><div className="hero-orbit"><img src="/logos/euphoria-logo.png" alt="Euphoria" style={{width:"88px",height:"auto"}} /></div></section>
+    <div className="metric-grid">
+      <Metric label="Registered" value={stats.total_registrations ?? "—"} tone="cyan"/>
+      <Metric label="Entered today" value={stats.entries_today ?? "—"} tone="green"/>
+      <Metric label="Entry rate" value={`${stats.entry_percentage ?? 0}%`} tone="gold"/>
+      <Metric label="Duplicate attempts" value={stats.duplicate_attempts ?? "—"} tone="red"/>
+    </div>
+    <section className="section-heading">
+      <div><p className="eyebrow">LIVE GATE STREAM</p><h2>Scans, as they happen</h2></div>
+      <div className="live-controls">
+        <span className={`live-pill ${paused ? "paused" : ""}`} data-testid="live-indicator"><i /> {paused ? "PAUSED" : "LIVE"}</span>
+        <button className="ghost compact" data-testid="live-toggle" onClick={() => setPaused(p => !p)}>{paused ? "Resume" : "Pause"}</button>
+      </div>
+    </section>
+    <div className="activity-list" data-testid="live-entry-stream">
+      {entries.length ? entries.map(item => <div className={`activity-row entry-row ${newIds.has(item.id) ? "row-flash" : ""}`} key={item.id} data-testid={`live-entry-${item.id}`}>
+        <span className="scan-icon ok">✓</span>
+        <div><strong>{item.participant_full_name || "Unknown participant"}</strong><small className="mono">{item.registration_number} · {item.event_category}</small></div>
+        <div className="entry-event muted">{item.event_name}</div>
+        <div className="entry-scanner"><small>SCANNER</small><b>{item.scanner_display_name || item.scanner_username || "—"}</b></div>
+        <time>{new Date(item.scanned_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</time>
+      </div>) : <div className="empty">No entries yet. When operators scan, participants will appear here in real time.</div>}
+    </div>
+  </Shell>;
+}
 function Metric({ label, value, tone }) { return <div className={`metric ${tone}`} data-testid={`metric-${label.toLowerCase().replaceAll(" ", "-")}`}><small>{label}</small><strong>{value}</strong><span>system count</span></div>; }
 
 const EMPTY_PARTICIPANT = { registration_number: "", participant_full_name: "", email: "", phone: "", event_name: "EUPHORIA 2026", event_category: "GENERAL" };
